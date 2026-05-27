@@ -274,6 +274,11 @@ pub mod tests {
 	pub fn repo_init_bare() -> Result<(TempDir, Repository)> {
 		init_log();
 
+		// Must run before `init_bare` so libgit2 ignores the user's
+		// global config (e.g. `init.defaultBranch`); tests assume the
+		// default branch is `master`.
+		sandbox_config_files();
+
 		let tmp_repo_dir = TempDir::new()?;
 		let bare_repo = Repository::init_bare(tmp_repo_dir.path())?;
 		Ok((tmp_repo_dir, bare_repo))
