@@ -45,13 +45,16 @@ const CHECKPOINT_INTERVAL: usize = 100;
 /// Mutable lane state plus the delta history needed to reconstruct
 /// any past row on demand.
 pub struct Buffer {
-	/// Live lane state after the last `update()`.
-	pub current: Vector<Option<Chunk>>,
-	/// Per-commit deltas, indexed by walker step.
-	pub deltas: Vec<Delta>,
+	/// Live lane state after the last `update()`. Read by the
+	/// walker when deciding whether to spawn a merger lane.
+	pub(crate) current: Vector<Option<Chunk>>,
+	/// Per-commit deltas, indexed by walker step. Crate-internal:
+	/// outside callers gate reads with [`Self::ready_up_to`] and
+	/// reconstruct row state via [`Self::decompress`].
+	pub(crate) deltas: Vec<Delta>,
 	/// Periodic snapshots so `decompress` doesn't have to replay
-	/// from the start.
-	pub checkpoints: BTreeMap<usize, Vector<Option<Chunk>>>,
+	/// from the start. Crate-internal.
+	pub(crate) checkpoints: BTreeMap<usize, Vector<Option<Chunk>>>,
 	mergers: Vec<usize>,
 	pending_delta: Vec<DeltaOp>,
 }
@@ -78,6 +81,14 @@ impl Buffer {
 	/// parent should be expanded into a fresh lane.
 	pub fn merger(&mut self, alias: usize) {
 		self.mergers.push(alias);
+	}
+
+	/// Has the buffer ingested at least `count` commits via
+	/// [`Self::update`]? Used by the async layer to gate render
+	/// requests on the in-flight walker reaching the visible
+	/// window.
+	pub const fn ready_up_to(&self, count: usize) -> bool {
+		self.deltas.len() >= count
 	}
 
 	/// Apply one commit's lane updates, append the resulting delta

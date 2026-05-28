@@ -15,9 +15,6 @@ pub mod walker;
 
 pub use walker::GraphWalker;
 
-/// The maximum number of colors to use for graph lanes.
-pub const MAX_LANE_COLORS: usize = 16;
-
 /// The type of connector between nodes in the graph. The renderer
 /// maps each variant to a fixed glyph; see `glyph_for` in the binary
 /// crate.
@@ -39,11 +36,13 @@ pub enum ConnectionType {
 	CommitStash,
 	/// Working-tree / uncommitted entry.
 	CommitUncommitted,
-	/// Left corner of a merge-bridge (┓).
+	/// Right end of a merge-bridge (┓): horizontal arc turns
+	/// downward into the merger lane.
 	MergeBridgeStart,
 	/// Middle segment of a merge-bridge (━).
 	MergeBridgeMid,
-	/// Right corner of a merge-bridge (┏).
+	/// Left end of a merge-bridge (┏): horizontal arc opens
+	/// rightward from the merge commit.
 	MergeBridgeEnd,
 	/// Lane forks downward into a child branch.
 	BranchDown,

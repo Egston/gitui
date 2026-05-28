@@ -111,7 +111,7 @@ impl AsyncLog {
 	) -> Option<Vec<GraphRow>> {
 		let walker_guard = self.graph_walker.lock().ok()?;
 		let needed_end = global_start + commit_slice.len();
-		if walker_guard.buffer.deltas.len() < needed_end {
+		if !walker_guard.buffer.ready_up_to(needed_end) {
 			return None;
 		}
 

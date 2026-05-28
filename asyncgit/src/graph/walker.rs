@@ -14,9 +14,6 @@ pub struct GraphWalker {
 	pub buffer: Buffer,
 	/// `CommitId` → numeric alias table.
 	pub oids: GraphOids,
-	/// Reserved for a future `branch_lane` mapping; currently
-	/// unused but preserved across `clear()`.
-	pub branch_lane_map: HashMap<CommitId, usize>,
 	/// For each merge alias, the alias of its second parent (used
 	/// to draw the merge-bridge).
 	pub mergers_map: HashMap<usize, usize>,
@@ -34,7 +31,6 @@ impl GraphWalker {
 		Self {
 			buffer: Buffer::new(),
 			oids: GraphOids::new(),
-			branch_lane_map: HashMap::new(),
 			mergers_map: HashMap::new(),
 		}
 	}
