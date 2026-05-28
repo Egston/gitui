@@ -760,29 +760,46 @@ mod tests {
 		// must appear before its parent regardless of timestamps).
 		// Time-order VIOLATES this: R.ts >> C.ts, so R pops out of
 		// the priority queue before C is emitted.
-		let mut grepo = gix_repo(repo_path)?;
-		let mut walk = LogWalkerWithoutFilter::new(
-			&mut grepo,
-			100,
-			LogOrdering::Topo,
-			false,
-		)?;
-		let mut items = Vec::new();
-		walk.read(&mut items)?;
+		let walk_with =
+			|ordering: LogOrdering| -> Result<Vec<CommitId>> {
+				let mut grepo = gix_repo(repo_path)?;
+				let mut walk = LogWalkerWithoutFilter::new(
+					&mut grepo, 100, ordering, false,
+				)?;
+				let mut items = Vec::new();
+				walk.read(&mut items)?;
+				Ok(items)
+			};
 
-		let pos = |c: &CommitId| {
+		let pos = |items: &[CommitId], c: &CommitId| {
 			items
 				.iter()
 				.position(|x| x == c)
 				.expect("commit not found in walk output")
 		};
+
+		let topo_items = walk_with(LogOrdering::Topo)?;
 		assert!(
-			pos(&commit_c) < pos(&commit_r),
-			"topo-order must emit child C before parent R \
-			 (time-order would violate this because R.ts >> \
-			 C.ts); got C={} R={}",
-			pos(&commit_c),
-			pos(&commit_r),
+			pos(&topo_items, &commit_c) < pos(&topo_items, &commit_r),
+			"topo-order must emit child C before parent R; \
+			 got C={} R={}",
+			pos(&topo_items, &commit_c),
+			pos(&topo_items, &commit_r),
+		);
+
+		// Contrastive: time-order on the same skewed-timestamp
+		// fixture MUST produce the opposite ordering (R before C).
+		// This proves `LogOrdering` is actually threaded through —
+		// if `set_ordering` silently no-op'd and always ran topo,
+		// the topo assertion above would still pass.
+		let time_items = walk_with(LogOrdering::Time)?;
+		assert!(
+			pos(&time_items, &commit_c) > pos(&time_items, &commit_r),
+			"time-order must emit R before C on this skewed fixture \
+			 (R.ts >> C.ts); if this fails, the LogOrdering flag is \
+			 likely not live; got C={} R={}",
+			pos(&time_items, &commit_c),
+			pos(&time_items, &commit_r),
 		);
 
 		Ok(())
@@ -945,6 +962,58 @@ mod tests {
 		assert_eq!(find_integrating_merge(&repo_path, m2)?, Some(m2));
 		// plain mainline commit → itself
 		assert_eq!(find_integrating_merge(&repo_path, m1)?, Some(m1));
+
+		Ok(())
+	}
+
+	/// `find_integrating_merge` must return `Ok(None)` for a commit
+	/// on a sibling branch that was never merged into HEAD — the
+	/// `merge_base` short-circuit at the top of the function.
+	#[test]
+	fn test_find_integrating_merge_unmerged_branch() -> Result<()> {
+		let file_path = Path::new("foo");
+		let branch_file = Path::new("bar");
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath =
+			root.as_os_str().to_str().unwrap().into();
+
+		// base on master
+		File::create(root.join(file_path))?.write_all(b"a")?;
+		stage_add_file(&repo_path, file_path).unwrap();
+		let base = commit(&repo_path, "base").unwrap();
+
+		// orphan branch `feat` off `base`, with one commit B —
+		// never merged back into master
+		repo.branch(
+			"feat",
+			&repo.find_commit(base.into()).unwrap(),
+			false,
+		)
+		.unwrap();
+		repo.set_head("refs/heads/feat").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		File::create(root.join(branch_file))?.write_all(b"b")?;
+		stage_add_file(&repo_path, branch_file).unwrap();
+		let b = commit(&repo_path, "B on feat").unwrap();
+
+		// back to master, advance the spine so feat has truly
+		// diverged
+		repo.set_head("refs/heads/master").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		File::create(root.join(file_path))?.write_all(b"a2")?;
+		stage_add_file(&repo_path, file_path).unwrap();
+		let _tip = commit(&repo_path, "tip").unwrap();
+
+		// HEAD is on master; B lives only on `feat`. No merge
+		// integrates it, so there is no integrating merge.
+		assert_eq!(find_integrating_merge(&repo_path, b)?, None);
 
 		Ok(())
 	}

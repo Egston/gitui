@@ -342,4 +342,37 @@ mod tests {
 			 the post-replace loop must clear that reference",
 		);
 	}
+
+	/// `ready_up_to` is the gate the async layer uses to decide
+	/// whether to render or wait. An off-by-one here would cause the
+	/// UI to either spin reading uninitialised state or stall when a
+	/// commit is in fact ready.
+	#[test]
+	fn ready_up_to_boundary() {
+		let mut buf = Buffer::new();
+
+		// Empty buffer: 0 is ready (vacuously), any positive count
+		// is not.
+		assert!(buf.ready_up_to(0));
+		assert!(!buf.ready_up_to(1));
+
+		let push = |buf: &mut Buffer, alias: usize| {
+			buf.update(&Chunk {
+				alias: Some(alias),
+				parent_a: None,
+				parent_b: None,
+				marker: Markers::Commit,
+			});
+		};
+
+		push(&mut buf, 1);
+		push(&mut buf, 2);
+		push(&mut buf, 3);
+		// After 3 updates: ready for any count <= 3, not for 4+.
+		assert!(buf.ready_up_to(0));
+		assert!(buf.ready_up_to(1));
+		assert!(buf.ready_up_to(3));
+		assert!(!buf.ready_up_to(4));
+		assert!(!buf.ready_up_to(100));
+	}
 }

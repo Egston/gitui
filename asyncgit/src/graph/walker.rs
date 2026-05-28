@@ -515,4 +515,54 @@ mod tests {
 			);
 		}
 	}
+
+	#[test]
+	fn test_octopus_first_parent_stays_single_lane() {
+		// Octopus merge (3+ parents) under first-parent mode: the
+		// walker must follow only parent 0 and ignore parents 1..N
+		// the same way it ignores parent 1 of a normal merge.
+		// Regression guard for the comment on `process` claiming
+		// "octopus merges are collapsed to normal merges".
+		let id = |n: u8| {
+			CommitId::from_str_unchecked(&format!("{n:040}")).unwrap()
+		};
+		let (a, b, c, d, m) = (id(1), id(2), id(3), id(4), id(5));
+
+		// M is a 3-parent merge of A, B, C; A is the spine root.
+		let commits: [(CommitId, Vec<CommitId>); 2] =
+			[(m, vec![a, b, c]), (a, vec![])];
+		// `d` is intentionally not referenced as a parent — keeps the
+		// fixture honest about which OIDs participate.
+		let _ = d;
+
+		let mut walker = GraphWalker::new();
+		for (id, parents) in &commits {
+			walker.process(id, parents, true);
+		}
+
+		let ids: Vec<CommitId> =
+			commits.iter().map(|(id, _)| *id).collect();
+		let rows = walker.compute_rows(
+			&ids,
+			0,
+			&HashSet::new(),
+			&HashSet::new(),
+			None,
+		);
+
+		assert_eq!(rows.len(), 2);
+		for row in &rows {
+			assert_eq!(
+				row.lane_count, 1,
+				"octopus merge under first-parent must stay \
+				 single-lane; got {}",
+				row.lane_count,
+			);
+			assert!(
+				!row.is_merge,
+				"octopus second/third parents must be ignored in \
+				 first-parent mode"
+			);
+		}
+	}
 }
