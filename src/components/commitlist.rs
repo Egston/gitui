@@ -1,11 +1,4 @@
-use super::utils::graphrow::{
-	SYM_BRANCH_DOWN, SYM_BRANCH_UP, SYM_BRANCH_UP_RIGHT, SYM_COMMIT,
-	SYM_COMMIT_BRANCH, SYM_COMMIT_MERGE, SYM_COMMIT_STASH,
-	SYM_COMMIT_UNCOMMITTED, SYM_CROSS, SYM_HORIZONTAL,
-	SYM_MERGE_BRIDGE_END, SYM_MERGE_BRIDGE_MID,
-	SYM_MERGE_BRIDGE_START, SYM_SPACE, SYM_VERTICAL,
-	SYM_VERTICAL_DOTTED,
-};
+use super::utils::graphrow::{glyph_for, SYM_HORIZONTAL, SYM_SPACE};
 use super::utils::logitems::{ItemBatch, LogEntry};
 use crate::{
 	app::Environment,
@@ -22,7 +15,7 @@ use crate::{
 };
 use anyhow::Result;
 use asyncgit::{
-	graph::{ConnectionType, GraphRow},
+	graph::GraphRow,
 	sync::{
 		self, checkout_commit, BranchDetails, BranchInfo, CommitId,
 		RepoPathRef, Tags,
@@ -56,10 +49,14 @@ const GRAPH_COLORS: &[Color] = &[
 	Color::Red,
 ];
 
+const fn lane_color(idx: usize) -> Color {
+	GRAPH_COLORS[idx % GRAPH_COLORS.len()]
+}
+
 ///
 pub struct CommitList {
 	repo: RepoPathRef,
-	title: Box<str>,
+	title: String,
 	selection: usize,
 	highlighted_selection: Option<usize>,
 	items: ItemBatch,
@@ -79,8 +76,6 @@ pub struct CommitList {
 	queue: Queue,
 	key_config: SharedKeyConfig,
 	show_graph: bool,
-	first_parent_mode: bool,
-	topo_mode: bool,
 	graph_col_width: Cell<usize>,
 }
 
@@ -104,12 +99,17 @@ impl CommitList {
 			theme: env.theme.clone(),
 			queue: env.queue.clone(),
 			key_config: env.key_config.clone(),
-			title: title.into(),
+			title: title.to_owned(),
 			show_graph: true,
-			first_parent_mode: false,
-			topo_mode: false,
 			graph_col_width: Cell::new(0),
 		}
+	}
+
+	/// Replace the list's title (the prefix shown in the block
+	/// border before the `selection/total` counter). Owner widgets
+	/// use this to append mode badges like ` [⊢ first-parent]`.
+	pub fn set_title(&mut self, title: String) {
+		self.title = title;
 	}
 
 	///
@@ -127,16 +127,6 @@ impl CommitList {
 	///
 	pub const fn tags(&self) -> Option<&Tags> {
 		self.tags.as_ref()
-	}
-
-	///
-	pub const fn set_first_parent_mode(&mut self, v: bool) {
-		self.first_parent_mode = v;
-	}
-
-	///
-	pub const fn set_topo_mode(&mut self, v: bool) {
-		self.topo_mode = v;
 	}
 
 	///
@@ -503,7 +493,6 @@ impl CommitList {
 		}
 	}
 
-	#[allow(clippy::too_many_lines)]
 	fn build_graph_spans<'a>(
 		row: &'a GraphRow,
 		graph_col_width: usize,
@@ -517,82 +506,9 @@ impl CommitList {
 			}
 			let (sym, graph_color) = match conn {
 				None => (SYM_SPACE, Color::Reset),
-				Some((ConnectionType::Vertical, color_idx)) => (
-					SYM_VERTICAL,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((ConnectionType::VerticalDotted, color_idx)) => {
-					(
-						SYM_VERTICAL_DOTTED,
-						GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-					)
+				Some((ct, color_idx)) => {
+					(glyph_for(*ct), lane_color(*color_idx))
 				}
-				Some((ConnectionType::Cross, color_idx)) => (
-					SYM_CROSS,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((ConnectionType::CommitNormal, color_idx)) => (
-					SYM_COMMIT,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((ConnectionType::CommitBranch, color_idx)) => (
-					SYM_COMMIT_BRANCH,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((ConnectionType::CommitMerge, color_idx)) => (
-					SYM_COMMIT_MERGE,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((ConnectionType::CommitStash, color_idx)) => (
-					SYM_COMMIT_STASH,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((
-					ConnectionType::CommitUncommitted,
-					color_idx,
-				)) => (
-					SYM_COMMIT_UNCOMMITTED,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((
-					ConnectionType::MergeBridgeStart,
-					color_idx,
-				)) => (
-					SYM_MERGE_BRIDGE_START,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((ConnectionType::MergeBridgeMid, color_idx)) => {
-					(
-						SYM_MERGE_BRIDGE_MID,
-						GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-					)
-				}
-				Some((ConnectionType::MergeBridgeEnd, color_idx)) => {
-					(
-						SYM_MERGE_BRIDGE_END,
-						GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-					)
-				}
-				Some((ConnectionType::BranchDown, color_idx)) => (
-					SYM_BRANCH_DOWN,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((
-					ConnectionType::BranchUp
-					| ConnectionType::BranchUpMergeStart,
-					color_idx,
-				)) => (
-					SYM_BRANCH_UP,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((
-					ConnectionType::BranchUpRight
-					| ConnectionType::BranchUpRightMergeEnd,
-					color_idx,
-				)) => (
-					SYM_BRANCH_UP_RIGHT,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
 			};
 			spans.push(Span::styled(
 				sym,
@@ -606,8 +522,7 @@ impl CommitList {
 			if let Some((from, to)) = row.merge_bridge {
 				if lane_index >= from && lane_index < to {
 					is_bridge_lane = true;
-					spacer_color = GRAPH_COLORS
-						[row.commit_lane % GRAPH_COLORS.len()];
+					spacer_color = lane_color(row.commit_lane);
 				}
 			}
 
@@ -619,8 +534,7 @@ impl CommitList {
 					} else {
 						from
 					};
-					spacer_color = GRAPH_COLORS
-						[branch_lane % GRAPH_COLORS.len()];
+					spacer_color = lane_color(branch_lane);
 				}
 			}
 
@@ -1081,25 +995,9 @@ impl DrawableComponent for CommitList {
 			selection,
 		));
 
-		let fp_badge = if self.first_parent_mode {
-			" [⊢ first-parent]"
-		} else {
-			""
-		};
-		// Topo ordering has no effect in first-parent mode (the git2
-		// first-parent walk is already linear and ignores LogOrdering),
-		// so the badge would be misleading there — hide it.
-		let topo_badge = if self.topo_mode && !self.first_parent_mode
-		{
-			" [topo]"
-		} else {
-			""
-		};
 		let title = format!(
-			"{}{}{} {}/{}",
+			"{} {}/{}",
 			self.title,
-			fp_badge,
-			topo_badge,
 			self.commits.len().saturating_sub(self.selection),
 			self.commits.len(),
 		);
@@ -1217,14 +1115,15 @@ impl Component for CommitList {
 
 #[cfg(test)]
 mod tests {
-	use asyncgit::sync::CommitInfo;
+	use asyncgit::{graph::ConnectionType, sync::CommitInfo};
 
 	use super::*;
+	use crate::components::utils::graphrow::SYM_COMMIT;
 
 	impl Default for CommitList {
 		fn default() -> Self {
 			Self {
-				title: String::new().into_boxed_str(),
+				title: String::new(),
 				selection: 0,
 				highlighted_selection: Option::None,
 				highlights: Option::None,
@@ -1244,8 +1143,6 @@ mod tests {
 				)),
 				queue: Queue::default(),
 				show_graph: true,
-				first_parent_mode: false,
-				topo_mode: false,
 				graph_col_width: Cell::new(0),
 			}
 		}

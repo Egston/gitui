@@ -107,9 +107,11 @@ impl Revlog {
 			env,
 			&strings::log_title(&env.key_config),
 		);
-		if topo_order {
-			list.set_topo_mode(true);
-		}
+		list.set_title(Self::compose_title(
+			&env.key_config,
+			false,
+			topo_order,
+		));
 		Self {
 			repo: env.repo.clone(),
 			queue: env.queue.clone(),
@@ -139,6 +141,36 @@ impl Revlog {
 		}
 	}
 
+	/// Build the log-pane title with mode badges. Single source of
+	/// truth for the badge text — `CommitList` itself only sees the
+	/// finished string.
+	fn compose_title(
+		key_config: &crate::keys::SharedKeyConfig,
+		first_parent: bool,
+		topo: bool,
+	) -> String {
+		let base = strings::log_title(key_config);
+		let fp = if first_parent {
+			" [⊢ first-parent]"
+		} else {
+			""
+		};
+		// Topo ordering has no effect in first-parent mode (the git2
+		// first-parent walk is already linear and ignores
+		// `LogOrdering`), so the badge would be misleading there.
+		let topo_badge =
+			if topo && !first_parent { " [topo]" } else { "" };
+		format!("{base}{fp}{topo_badge}")
+	}
+
+	fn refresh_title(&mut self) {
+		self.list.set_title(Self::compose_title(
+			&self.key_config,
+			self.first_parent_mode,
+			self.topo_order,
+		));
+	}
+
 	fn toggle_first_parent(&mut self) -> Result<()> {
 		let selected = self.selected_commit();
 		self.first_parent_mode = !self.first_parent_mode;
@@ -164,7 +196,7 @@ impl Revlog {
 		};
 
 		self.git_log.set_first_parent(self.first_parent_mode)?;
-		self.list.set_first_parent_mode(self.first_parent_mode);
+		self.refresh_title();
 		self.list.clear();
 		self.awaiting_mode_change = true;
 		self.git_log.fetch()?;
@@ -180,7 +212,7 @@ impl Revlog {
 		} else {
 			LogOrdering::Time
 		})?;
-		self.list.set_topo_mode(self.topo_order);
+		self.refresh_title();
 		self.options
 			.borrow_mut()
 			.set_log_topo_order(self.topo_order);
