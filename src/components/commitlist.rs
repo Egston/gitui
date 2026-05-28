@@ -81,6 +81,12 @@ pub struct CommitList {
 	key_config: SharedKeyConfig,
 	show_graph: bool,
 	graph_col_width: Cell<usize>,
+	/// True iff `move_selection` has actually moved the cursor
+	/// since the flag was last cleared via
+	/// [`Self::take_user_navigation_flag`]. Used by the owning
+	/// tab to distinguish "user explicitly moved" from "selection
+	/// changed because of a reload / `pending_selection` landing".
+	user_navigated: bool,
 }
 
 impl CommitList {
@@ -106,6 +112,7 @@ impl CommitList {
 			title: title.to_owned(),
 			show_graph: true,
 			graph_col_width: Cell::new(0),
+			user_navigated: false,
 		}
 	}
 
@@ -363,7 +370,24 @@ impl CommitList {
 			self.move_selection_normal(scroll)?
 		};
 
+		if needs_update {
+			// Real cursor movement caused by user input; flag it so
+			// the owning tab can tell "user navigated here" from
+			// "selection changed via reload / pending landing".
+			self.user_navigated = true;
+		}
+
 		Ok(needs_update)
+	}
+
+	/// Read-and-clear the navigation flag set by `move_selection`.
+	/// Returns whether the cursor was moved by user input since the
+	/// last call. The owning tab uses this to decide whether to
+	/// restore a pre-toggle origin or honor the current selection.
+	pub const fn take_user_navigation_flag(&mut self) -> bool {
+		let v = self.user_navigated;
+		self.user_navigated = false;
+		v
 	}
 
 	fn move_selection_highlighting(
@@ -1171,6 +1195,7 @@ mod tests {
 				)),
 				queue: Queue::default(),
 				show_graph: true,
+				user_navigated: false,
 				graph_col_width: Cell::new(0),
 			}
 		}

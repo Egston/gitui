@@ -80,6 +80,15 @@ pub struct Revlog {
 	first_parent_mode: bool,
 	topo_order: bool,
 	pending_selection: Option<CommitId>,
+	/// Commit selected immediately before entering first-parent
+	/// mode. On exit, if the user *didn't* navigate inside FP (per
+	/// `CommitList::take_user_navigation_flag`), this is restored
+	/// so a round-trip toggle returns the cursor home — even if the
+	/// FP walk happened to leave `selection` pointing at some other
+	/// commit by accident. Always drained on exit (both branches of
+	/// `toggle_first_parent` call `take()`), so it never carries
+	/// over across subsequent toggles.
+	first_parent_origin: Option<CommitId>,
 	/// True from the moment a mode-change toggle is dispatched until
 	/// the next `fetch()` actually starts a new walk. While true,
 	/// `update()` skips `extract_items()` so commits the previous
@@ -139,6 +148,7 @@ impl Revlog {
 			first_parent_mode: false,
 			topo_order,
 			pending_selection: None,
+			first_parent_origin: None,
 			awaiting_mode_change: false,
 			options: env.options.clone(),
 		}
@@ -172,13 +182,21 @@ impl Revlog {
 
 	fn toggle_first_parent(&mut self) -> Result<()> {
 		let selected = self.selected_commit();
+		// Read-and-clear before flipping mode: any nav since the
+		// previous toggle belongs to the *outgoing* mode session.
+		let user_navigated = self.list.take_user_navigation_flag();
 		self.first_parent_mode = !self.first_parent_mode;
 
 		// choose which commit to re-select once the reload lands
 		self.pending_selection = if self.first_parent_mode {
-			// entering first-parent: land on the integrating
-			// merge of the previously selected commit (itself
-			// if already on the spine)
+			// Entering first-parent: remember where the user came
+			// from so the round-trip toggle preserves selection even
+			// when FP leaves the cursor on something arbitrary (a
+			// filter highlighted only off-spine commits, or the
+			// give-up branch dropped the selection), then land on
+			// the integrating merge of the previously selected
+			// commit (itself if already on the spine).
+			self.first_parent_origin = selected;
 			match selected {
 				Some(c) => match find_integrating_merge(
 					&self.repo.borrow(),
@@ -196,9 +214,18 @@ impl Revlog {
 				None => None,
 			}
 		} else {
-			// leaving first-parent: the commit is in the
-			// superset
-			selected
+			// Leaving first-parent: if the user actually navigated
+			// while in FP mode, honor their current selection — they
+			// intentionally moved. Otherwise restore the pre-FP
+			// origin, which handles both "no commit selected"
+			// (`selected_commit() == None`) and "selection landed on
+			// some arbitrary commit because the index happened to
+			// fall in-range" — neither case is what the user wanted.
+			if user_navigated {
+				selected.or_else(|| self.first_parent_origin.take())
+			} else {
+				self.first_parent_origin.take().or(selected)
+			}
 		};
 
 		self.git_log.set_first_parent(self.first_parent_mode)?;
