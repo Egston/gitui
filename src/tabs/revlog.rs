@@ -16,11 +16,12 @@ use anyhow::Result;
 use asyncgit::{
 	asyncjob::AsyncSingleJob,
 	sync::{
-		self, filter_commit_by_search, CommitId, LogFilterSearch,
-		LogFilterSearchOptions, RepoPathRef,
+		self, filter_commit_by_search, find_integrating_merge,
+		CommitId, LogFilterSearch, LogFilterSearchOptions,
+		RepoPathRef,
 	},
 	AsyncBranchesJob, AsyncCommitFilterJob, AsyncGitNotification,
-	AsyncLog, AsyncTags, CommitFilesParams, FetchStatus,
+	AsyncLog, AsyncTags, CommitFilesParams, FetchStatus, LogOrdering,
 	ProgressPercent,
 };
 use crossbeam_channel::Sender;
@@ -61,6 +62,7 @@ enum LogSearch {
 }
 
 ///
+#[allow(clippy::struct_excessive_bools)]
 pub struct Revlog {
 	repo: RepoPathRef,
 	commit_details: CommitDetailsComponent,
@@ -76,24 +78,44 @@ pub struct Revlog {
 	sender: Sender<AsyncGitNotification>,
 	theme: SharedTheme,
 	first_parent_mode: bool,
+	topo_order: bool,
+	pending_selection: Option<CommitId>,
+	/// True from the moment a mode-change toggle is dispatched until
+	/// the next `fetch()` actually starts a new walk. While true,
+	/// `update()` skips `extract_items()` so commits the previous
+	/// (cancelled) walker is still draining can't leak into the list
+	/// under the new badge.
+	awaiting_mode_change: bool,
+	options: crate::options::SharedOptions,
 }
 
 impl Revlog {
 	///
 	pub fn new(env: &Environment) -> Self {
+		let topo_order = env.options.borrow().log_topo_order();
+		let mut git_log = AsyncLog::new(
+			env.repo.borrow().clone(),
+			&env.sender_git,
+			None,
+		);
+		if topo_order {
+			// ignore error: head not resolvable yet just means
+			// the first fetch starts fresh anyway
+			let _ = git_log.set_ordering(LogOrdering::Topo);
+		}
+		let mut list = CommitList::new(
+			env,
+			&strings::log_title(&env.key_config),
+		);
+		if topo_order {
+			list.set_topo_mode(true);
+		}
 		Self {
 			repo: env.repo.clone(),
 			queue: env.queue.clone(),
 			commit_details: CommitDetailsComponent::new(env),
-			list: CommitList::new(
-				env,
-				&strings::log_title(&env.key_config),
-			),
-			git_log: AsyncLog::new(
-				env.repo.borrow().clone(),
-				&env.sender_git,
-				None,
-			),
+			list,
+			git_log,
 			search: LogSearch::Off,
 			git_tags: AsyncTags::new(
 				env.repo.borrow().clone(),
@@ -110,14 +132,60 @@ impl Revlog {
 			sender: env.sender_git.clone(),
 			theme: env.theme.clone(),
 			first_parent_mode: false,
+			topo_order,
+			pending_selection: None,
+			awaiting_mode_change: false,
+			options: env.options.clone(),
 		}
 	}
 
 	fn toggle_first_parent(&mut self) -> Result<()> {
+		let selected = self.selected_commit();
 		self.first_parent_mode = !self.first_parent_mode;
+
+		// choose which commit to re-select once the reload lands
+		self.pending_selection = if self.first_parent_mode {
+			// entering first-parent: land on the integrating
+			// merge of the previously selected commit (itself
+			// if already on the spine)
+			match selected {
+				Some(c) => {
+					find_integrating_merge(&self.repo.borrow(), c)
+						.ok()
+						.flatten()
+						.or(Some(c))
+				}
+				None => None,
+			}
+		} else {
+			// leaving first-parent: the commit is in the
+			// superset
+			selected
+		};
+
 		self.git_log.set_first_parent(self.first_parent_mode)?;
 		self.list.set_first_parent_mode(self.first_parent_mode);
 		self.list.clear();
+		self.awaiting_mode_change = true;
+		self.git_log.fetch()?;
+		Ok(())
+	}
+
+	fn toggle_topo_order(&mut self) -> Result<()> {
+		self.topo_order = !self.topo_order;
+		self.pending_selection = self.selected_commit();
+
+		self.git_log.set_ordering(if self.topo_order {
+			LogOrdering::Topo
+		} else {
+			LogOrdering::Time
+		})?;
+		self.list.set_topo_mode(self.topo_order);
+		self.options
+			.borrow_mut()
+			.set_log_topo_order(self.topo_order);
+		self.list.clear();
+		self.awaiting_mode_change = true;
 		self.git_log.fetch()?;
 		Ok(())
 	}
@@ -141,10 +209,28 @@ impl Revlog {
 		if self.is_visible() {
 			if self.git_log.fetch()? == FetchStatus::Started {
 				self.list.clear();
+				// fresh walk under the new mode is up; safe to
+				// resume pulling streamed commits.
+				self.awaiting_mode_change = false;
 			}
 
-			self.list
-				.refresh_extend_data(self.git_log.extract_items()?);
+			if !self.awaiting_mode_change {
+				self.list.refresh_extend_data(
+					self.git_log.extract_items()?,
+				);
+			}
+
+			if let Some(target) = self.pending_selection {
+				if self.list.select_commit(target).is_ok() {
+					self.pending_selection = None;
+				} else if !self.git_log.is_pending() {
+					// the reload finished and the target never
+					// loaded (e.g. an off-spine commit absent from
+					// the new walk): give up rather than retry on
+					// every tick for the rest of the session.
+					self.pending_selection = None;
+				}
+			}
 
 			let (slice, global_start) = self.list.get_loaded_slice();
 			if !slice.is_empty() {
@@ -655,6 +741,13 @@ impl Component for Revlog {
 				{
 					self.toggle_first_parent()?;
 					return Ok(EventState::Consumed);
+				} else if key_match(
+					k,
+					self.key_config.keys.log_ordering,
+				) && !self.is_search_pending()
+				{
+					self.toggle_topo_order()?;
+					return Ok(EventState::Consumed);
 				}
 			}
 		}
@@ -695,6 +788,15 @@ impl Component for Revlog {
 			true,
 			self.visible,
 		));
+
+		out.push(
+			CommandInfo::new(
+				strings::commands::log_ordering(&self.key_config),
+				true,
+				self.visible,
+			)
+			.order(order::RARE_ACTION),
+		);
 
 		out.push(CommandInfo::new(
 			strings::commands::commit_details_open(&self.key_config),

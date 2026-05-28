@@ -77,7 +77,7 @@ pub use crate::{
 	push::{AsyncPush, PushRequest},
 	push_tags::{AsyncPushTags, PushTagsRequest},
 	remote_progress::{RemoteProgress, RemoteProgressState},
-	revlog::{AsyncLog, FetchStatus},
+	revlog::{AsyncLog, FetchStatus, LogOrdering},
 	status::{AsyncStatus, StatusParams},
 	sync::{
 		diff::{DiffLine, DiffLineType, FileDiff},

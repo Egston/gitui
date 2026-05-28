@@ -1,7 +1,11 @@
-use super::{CommitId, SharedCommitFilterFn};
+use super::{
+	repository::repo, CommitId, RepoPath, SharedCommitFilterFn,
+};
 use crate::error::Result;
+use crate::LogOrdering;
 use git2::{Commit, Oid, Repository};
 use gix::revision::Walk;
+use gix::traverse::commit::topo;
 use std::{
 	cmp::Ordering,
 	collections::{BinaryHeap, HashSet},
@@ -121,6 +125,16 @@ impl<'a> LogWalker<'a> {
 	}
 }
 
+type TopoWalk = gix::traverse::commit::Topo<
+	gix::OdbHandle,
+	fn(&gix::oid) -> bool,
+>;
+
+enum WalkSource<'a> {
+	Simple(Walk<'a>),
+	Topo(Box<TopoWalk>),
+}
+
 /// This is separate from `LogWalker` because filtering currently (June 2024) works through
 /// `SharedCommitFilterFn`.
 ///
@@ -132,7 +146,7 @@ impl<'a> LogWalker<'a> {
 /// A more long-term option is to refactor filtering to work with a `gix::Repository` and to remove
 /// `LogWalker` once this is done, but this is a larger effort.
 pub struct LogWalkerWithoutFilter<'a> {
-	walk: Walk<'a>,
+	walk: WalkSource<'a>,
 	limit: usize,
 	visited: usize,
 }
@@ -142,21 +156,39 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 	pub fn new(
 		repo: &'a mut gix::Repository,
 		limit: usize,
+		ordering: LogOrdering,
 	) -> Result<Self> {
-		// This seems to be an object cache size that yields optimal performance. There’s no specific
-		// reason this is 2^14, so benchmarking might reveal that there’s better values.
+		// This seems to be an object cache size that yields optimal
+		// performance. There's no specific reason this is 2^14, so
+		// benchmarking might reveal that there's better values.
 		repo.object_cache_size_if_unset(2_usize.pow(14));
 
 		let commit = repo.head()?.peel_to_commit()?;
-
 		let tips = [commit.id];
 
-		let platform = repo
-			.rev_walk(tips)
-			.sorting(gix::revision::walk::Sorting::ByCommitTime(gix::traverse::commit::simple::CommitTimeOrder::NewestFirst))
-			.use_commit_graph(false);
-
-		let walk = platform.all()?;
+		let walk = match ordering {
+			LogOrdering::Time => {
+				let platform = repo
+					.rev_walk(tips)
+					.sorting(
+						gix::revision::walk::Sorting::ByCommitTime(
+							gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+						),
+					)
+					.use_commit_graph(false);
+				WalkSource::Simple(platform.all()?)
+			}
+			LogOrdering::Topo => {
+				let topo_walk = topo::Builder::from_iters(
+					repo.objects.clone(),
+					tips,
+					None::<Vec<gix::ObjectId>>,
+				)
+				.sorting(topo::Sorting::TopoOrder)
+				.build()?;
+				WalkSource::Topo(Box::new(topo_walk))
+			}
+		};
 
 		Ok(Self {
 			walk,
@@ -174,11 +206,21 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 	pub fn read(&mut self, out: &mut Vec<CommitId>) -> Result<usize> {
 		let mut count = 0_usize;
 
-		while let Some(Ok(info)) = self.walk.next() {
-			out.push(info.id.into());
+		loop {
+			#[allow(clippy::redundant_closure_for_method_calls)]
+			let next_id = match &mut self.walk {
+				WalkSource::Simple(w) => {
+					w.next().and_then(|r| r.ok()).map(|i| i.id)
+				}
+				WalkSource::Topo(w) => {
+					w.next().and_then(|r| r.ok()).map(|i| i.id)
+				}
+			};
+
+			let Some(id) = next_id else { break };
+			out.push(id.into());
 
 			count += 1;
-
 			if count == self.limit {
 				break;
 			}
@@ -188,6 +230,47 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 
 		Ok(count)
 	}
+}
+
+/// Returns the oldest commit on HEAD's first-parent spine that is a
+/// descendant of (or equal to) `target`.
+///
+/// For an off-spine branch commit this is the merge commit that
+/// integrated its branch into the mainline; for a commit already on
+/// the spine it is the commit itself. Returns `None` if `target` is
+/// not an ancestor of HEAD.
+pub fn find_integrating_merge(
+	repo_path: &RepoPath,
+	target: CommitId,
+) -> Result<Option<CommitId>> {
+	let repo = repo(repo_path)?;
+	let target_oid: Oid = target.into();
+
+	let mut current = repo.head()?.peel_to_commit()?;
+	let mut answer: Option<CommitId> = None;
+
+	loop {
+		let cur_oid = current.id();
+		let is_desc = cur_oid == target_oid
+			|| repo.graph_descendant_of(cur_oid, target_oid)?;
+
+		if is_desc {
+			// still on/above the integrating merge: remember it and
+			// keep descending the first-parent spine.
+			answer = Some(cur_oid.into());
+		} else {
+			// dropped below it; the last remembered spine commit is
+			// the integrating merge.
+			break;
+		}
+
+		match current.parent(0) {
+			Ok(p) => current = p,
+			Err(_) => break,
+		}
+	}
+
+	Ok(answer)
 }
 
 #[cfg(test)]
@@ -282,7 +365,11 @@ mod tests {
 		let oid2 = commit(repo_path, "commit2").unwrap();
 
 		let mut repo: gix::Repository = gix_repo(repo_path)?;
-		let mut walk = LogWalkerWithoutFilter::new(&mut repo, 100)?;
+		let mut walk = LogWalkerWithoutFilter::new(
+			&mut repo,
+			100,
+			crate::LogOrdering::Time,
+		)?;
 		let mut items = Vec::new();
 		assert!(matches!(walk.read(&mut items), Ok(2)));
 
@@ -449,6 +536,286 @@ mod tests {
 		walker.read(&mut items).unwrap();
 
 		assert_eq!(items.len(), 0);
+
+		Ok(())
+	}
+
+	/// Build a test repo with the following history:
+	///
+	/// ```text
+	///   R  (root, current-time timestamp — VERY NEW)
+	///   |\
+	///   | C  (mainline, ts=2_000 — intentionally OLD)
+	///   | |
+	///   | B1 (branch, ts=3_000)
+	///   | |
+	///   | B2 (branch, ts=4_000)
+	///   |/
+	///   M  (merge, ts=5_000, parents=[C, B2])
+	/// ```
+	///
+	/// Because R was created with the real wall-clock time (via
+	/// `commit()`) its timestamp is far in the future relative to
+	/// C/B1/B2/M.  Under **time-order** the priority queue pops R
+	/// before C (R.ts >> C.ts=2000), so the output is:
+	///   M, B2, B1, R, C   ← R appears before C (child-before-parent
+	///                         violated!)
+	///
+	/// Under **topo-order** the indegree algorithm enforces that every
+	/// child is emitted before its parents, so the output is:
+	///   M, B2, B1, C, R   ← C before R (correct)
+	///
+	/// The test asserts `pos(C) < pos(R)`, which passes with topo-order
+	/// and fails with time-order.
+	#[test]
+	fn test_logwalker_without_filter_topo_order() -> Result<()> {
+		use crate::LogOrdering;
+
+		let file_path = Path::new("foo");
+		let branch_file = Path::new("bar");
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+
+		// Root commit R — uses current wall-clock time, so its
+		// timestamp is VERY large relative to C/B1/B2/M below.
+		File::create(root.join(file_path))?.write_all(b"r")?;
+		stage_add_file(repo_path, file_path).unwrap();
+		let commit_r = commit(repo_path, "R root").unwrap();
+
+		// Mainline commit C: child of R, but with a deliberately
+		// OLD timestamp (2_000) so time-order will pop R before C.
+		File::create(root.join(file_path))?.write_all(b"c")?;
+		stage_add_file(repo_path, file_path).unwrap();
+		let commit_c = {
+			let sig = git2::Signature::new(
+				"a",
+				"a@b.c",
+				&git2::Time::new(2_000, 0),
+			)
+			.unwrap();
+			let tree = repo
+				.find_tree(
+					repo.index().unwrap().write_tree().unwrap(),
+				)
+				.unwrap();
+			let parent =
+				repo.head().unwrap().peel_to_commit().unwrap();
+			let oid = repo
+				.commit(
+					Some("HEAD"),
+					&sig,
+					&sig,
+					"C old mainline",
+					&tree,
+					&[&parent],
+				)
+				.unwrap();
+			CommitId::new(oid)
+		};
+
+		// Branch off R, two newer branch commits B1 (ts=3_000) and
+		// B2 (ts=4_000).
+		let commit_r_raw = {
+			repo.find_commit(commit_c.into())
+				.unwrap()
+				.parent(0)
+				.unwrap()
+		};
+		repo.branch("feat", &commit_r_raw, false).unwrap();
+		repo.set_head("refs/heads/feat").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+
+		File::create(root.join(branch_file))?.write_all(b"b1")?;
+		stage_add_file(repo_path, branch_file).unwrap();
+		let _commit_b1 = {
+			let sig = git2::Signature::new(
+				"a",
+				"a@b.c",
+				&git2::Time::new(3_000, 0),
+			)
+			.unwrap();
+			let tree = repo
+				.find_tree(
+					repo.index().unwrap().write_tree().unwrap(),
+				)
+				.unwrap();
+			let parent =
+				repo.head().unwrap().peel_to_commit().unwrap();
+			repo.commit(
+				Some("HEAD"),
+				&sig,
+				&sig,
+				"B1",
+				&tree,
+				&[&parent],
+			)
+			.unwrap()
+		};
+
+		File::create(root.join(branch_file))?.write_all(b"b2")?;
+		stage_add_file(repo_path, branch_file).unwrap();
+		let commit_b2 = {
+			let sig = git2::Signature::new(
+				"a",
+				"a@b.c",
+				&git2::Time::new(4_000, 0),
+			)
+			.unwrap();
+			let tree = repo
+				.find_tree(
+					repo.index().unwrap().write_tree().unwrap(),
+				)
+				.unwrap();
+			let parent =
+				repo.head().unwrap().peel_to_commit().unwrap();
+			let oid = repo
+				.commit(
+					Some("HEAD"),
+					&sig,
+					&sig,
+					"B2",
+					&tree,
+					&[&parent],
+				)
+				.unwrap();
+			CommitId::new(oid)
+		};
+
+		// Back to master; create merge M (ts=5_000), parents=[C, B2].
+		repo.set_head("refs/heads/master").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		let c_raw = repo.find_commit(commit_c.into()).unwrap();
+		let b2_raw = repo.find_commit(commit_b2.into()).unwrap();
+		let _merge = {
+			let mut index =
+				repo.merge_commits(&c_raw, &b2_raw, None).unwrap();
+			let tree_id = index.write_tree_to(&repo).unwrap();
+			let tree = repo.find_tree(tree_id).unwrap();
+			let sig = git2::Signature::new(
+				"a",
+				"a@b.c",
+				&git2::Time::new(5_000, 0),
+			)
+			.unwrap();
+			repo.commit(
+				Some("HEAD"),
+				&sig,
+				&sig,
+				"merge feat",
+				&tree,
+				&[&c_raw, &b2_raw],
+			)
+			.unwrap()
+		};
+
+		// Topo-order must emit C before R (C is a child of R, so it
+		// must appear before its parent regardless of timestamps).
+		// Time-order VIOLATES this: R.ts >> C.ts, so R pops out of
+		// the priority queue before C is emitted.
+		let mut grepo = gix_repo(repo_path)?;
+		let mut walk = LogWalkerWithoutFilter::new(
+			&mut grepo,
+			100,
+			LogOrdering::Topo,
+		)?;
+		let mut items = Vec::new();
+		walk.read(&mut items)?;
+
+		let pos = |c: &CommitId| {
+			items
+				.iter()
+				.position(|x| x == c)
+				.expect("commit not found in walk output")
+		};
+		assert!(
+			pos(&commit_c) < pos(&commit_r),
+			"topo-order must emit child C before parent R \
+			 (time-order would violate this because R.ts >> \
+			 C.ts); got C={} R={}",
+			pos(&commit_c),
+			pos(&commit_r),
+		);
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_find_integrating_merge() -> Result<()> {
+		let file_path = Path::new("foo");
+		let branch_file = Path::new("bar");
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath =
+			root.as_os_str().to_str().unwrap().into();
+
+		// base + M1 (mainline)
+		File::create(root.join(file_path))?.write_all(b"a")?;
+		stage_add_file(&repo_path, file_path).unwrap();
+		let _base = commit(&repo_path, "base").unwrap();
+		File::create(root.join(file_path))?.write_all(b"a2")?;
+		stage_add_file(&repo_path, file_path).unwrap();
+		let m1 = commit(&repo_path, "M1 mainline").unwrap();
+
+		// branch feat off M1: b1, b2
+		repo.branch(
+			"feat",
+			&repo.find_commit(m1.into()).unwrap(),
+			false,
+		)
+		.unwrap();
+		repo.set_head("refs/heads/feat").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		File::create(root.join(branch_file))?.write_all(b"b1")?;
+		stage_add_file(&repo_path, branch_file).unwrap();
+		let b1 = commit(&repo_path, "b1").unwrap();
+		File::create(root.join(branch_file))?.write_all(b"b2")?;
+		stage_add_file(&repo_path, branch_file).unwrap();
+		let b2 = commit(&repo_path, "b2").unwrap();
+
+		// back to master, merge → M2
+		repo.set_head("refs/heads/master").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		let m2 = {
+			let feat_c = repo.find_commit(b2.into()).unwrap();
+			let main_c = repo.find_commit(m1.into()).unwrap();
+			let mut index =
+				repo.merge_commits(&main_c, &feat_c, None).unwrap();
+			let tree_id = index.write_tree_to(&repo).unwrap();
+			let tree = repo.find_tree(tree_id).unwrap();
+			let sig = repo.signature().unwrap();
+			let oid = repo
+				.commit(
+					Some("HEAD"),
+					&sig,
+					&sig,
+					"M2 merge",
+					&tree,
+					&[&main_c, &feat_c],
+				)
+				.unwrap();
+			CommitId::new(oid)
+		};
+
+		// off-spine branch commit → its integrating merge
+		assert_eq!(find_integrating_merge(&repo_path, b1)?, Some(m2));
+		// on-spine merge → itself
+		assert_eq!(find_integrating_merge(&repo_path, m2)?, Some(m2));
+		// plain mainline commit → itself
+		assert_eq!(find_integrating_merge(&repo_path, m1)?, Some(m1));
 
 		Ok(())
 	}

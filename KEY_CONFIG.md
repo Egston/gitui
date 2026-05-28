@@ -34,6 +34,13 @@ Possible values for:
 
 Here is a [vim style key config](vim_style_key_config.ron) with `h`, `j`, `k`, `l` to navigate. Use it to copy the content into `key_bindings.ron` to get vim style key bindings.
 
+## Log-specific keys
+
+In the log view, you can also customize:
+* `log_toggle_graph`: toggle the commit graph display (default: `g`)
+* `log_first_parent`: show only first-parent (mainline) history (default: `Shift+P`)
+* `log_ordering`: toggle topological vs time commit ordering (default: `Shift+O`)
+
 # Key Symbols
 
 Similar to the above GitUI allows you to change the way the UI visualizes key combos containing special keys like `enter`(default: `⏎`) and `shift`(default: `⇧`).

@@ -72,7 +72,9 @@ pub use hooks::{
 };
 pub use hunks::{reset_hunk, stage_hunk, unstage_hunk};
 pub use ignore::add_to_ignore;
-pub use logwalker::{LogWalker, LogWalkerWithoutFilter};
+pub use logwalker::{
+	find_integrating_merge, LogWalker, LogWalkerWithoutFilter,
+};
 pub use merge::{
 	abort_pending_rebase, abort_pending_state,
 	continue_pending_rebase, merge_branch, merge_commit, merge_msg,

@@ -22,6 +22,8 @@ struct OptionsData {
 	pub diff: DiffOptions,
 	pub status_show_untracked: Option<ShowUntrackedFilesConfig>,
 	pub commit_msgs: Vec<String>,
+	#[serde(default)]
+	pub log_topo_order: bool,
 }
 
 const COMMIT_MSG_HISTORY_LENGTH: usize = 20;
@@ -77,6 +79,15 @@ impl Options {
 		value: Option<ShowUntrackedFilesConfig>,
 	) {
 		self.data.status_show_untracked = value;
+		self.save();
+	}
+
+	pub const fn log_topo_order(&self) -> bool {
+		self.data.log_topo_order
+	}
+
+	pub fn set_log_topo_order(&mut self, value: bool) {
+		self.data.log_topo_order = value;
 		self.save();
 	}
 

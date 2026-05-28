@@ -131,6 +131,7 @@ pub struct KeysList {
 	pub goto_line: GituiKeyEvent,
 	pub log_toggle_graph: GituiKeyEvent,
 	pub log_first_parent: GituiKeyEvent,
+	pub log_ordering: GituiKeyEvent,
 }
 
 #[rustfmt::skip]
@@ -231,6 +232,7 @@ impl Default for KeysList {
 			goto_line: GituiKeyEvent::new(KeyCode::Char('L'),  KeyModifiers::SHIFT),
 			log_toggle_graph: GituiKeyEvent::new(KeyCode::Char('g'),  KeyModifiers::empty()),
 			log_first_parent: GituiKeyEvent::new(KeyCode::Char('P'),  KeyModifiers::SHIFT),
+			log_ordering: GituiKeyEvent::new(KeyCode::Char('O'),  KeyModifiers::SHIFT),
 		}
 	}
 }

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 * Now with a graph view!
+* first-parent toggle in the log view (default: `Shift+P`) — hide side-branch commits, show only the mainline
+* topological commit ordering toggle in the log view (default: `Shift+O`), persisted across sessions
+* preserve the selected commit across log-view toggles (first-parent and topo order)
 
 ### Changed
 * use [tombi](https://github.com/tombi-toml/tombi) for all toml file formatting

@@ -1634,6 +1634,17 @@ pub mod commands {
 		)
 	}
 
+	pub fn log_ordering(key_config: &SharedKeyConfig) -> CommandText {
+		CommandText::new(
+			format!(
+				"Topo Order [{}]",
+				key_config.get_hint(key_config.keys.log_ordering),
+			),
+			"toggle topological vs time commit ordering",
+			CMD_GROUP_LOG,
+		)
+	}
+
 	pub fn reset_commit(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
 			format!(

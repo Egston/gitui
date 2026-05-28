@@ -80,6 +80,7 @@ pub struct CommitList {
 	key_config: SharedKeyConfig,
 	show_graph: bool,
 	first_parent_mode: bool,
+	topo_mode: bool,
 	graph_col_width: Cell<usize>,
 }
 
@@ -106,6 +107,7 @@ impl CommitList {
 			title: title.into(),
 			show_graph: true,
 			first_parent_mode: false,
+			topo_mode: false,
 			graph_col_width: Cell::new(0),
 		}
 	}
@@ -130,6 +132,11 @@ impl CommitList {
 	///
 	pub const fn set_first_parent_mode(&mut self, v: bool) {
 		self.first_parent_mode = v;
+	}
+
+	///
+	pub const fn set_topo_mode(&mut self, v: bool) {
+		self.topo_mode = v;
 	}
 
 	///
@@ -1075,15 +1082,25 @@ impl DrawableComponent for CommitList {
 			selection,
 		));
 
-		let badge = if self.first_parent_mode {
+		let fp_badge = if self.first_parent_mode {
 			" [⊢ first-parent]"
 		} else {
 			""
 		};
+		// Topo ordering has no effect in first-parent mode (the git2
+		// first-parent walk is already linear and ignores LogOrdering),
+		// so the badge would be misleading there — hide it.
+		let topo_badge = if self.topo_mode && !self.first_parent_mode
+		{
+			" [topo]"
+		} else {
+			""
+		};
 		let title = format!(
-			"{}{} {}/{}",
+			"{}{}{} {}/{}",
 			self.title,
-			badge,
+			fp_badge,
+			topo_badge,
 			self.commits.len().saturating_sub(self.selection),
 			self.commits.len(),
 		);
@@ -1229,6 +1246,7 @@ mod tests {
 				queue: Queue::default(),
 				show_graph: true,
 				first_parent_mode: false,
+				topo_mode: false,
 				graph_col_width: Cell::new(0),
 			}
 		}

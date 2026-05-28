@@ -19,6 +19,17 @@ use std::{
 	time::{Duration, Instant},
 };
 
+/// Ordering for the commit log walk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LogOrdering {
+	/// Commit-timestamp order (default, historical behaviour).
+	#[default]
+	Time,
+	/// `git log --topo-order`: no parent shown before all its children,
+	/// and separate lines of history are not intermixed.
+	Topo,
+}
+
 ///
 #[derive(PartialEq, Eq, Debug)]
 pub enum FetchStatus {
@@ -49,6 +60,11 @@ pub struct AsyncLog {
 	repo: RepoPath,
 	graph_walker: Arc<Mutex<GraphWalker>>,
 	first_parent: bool,
+	ordering: LogOrdering,
+	/// Set when a mode change asks the in-flight walker to exit
+	/// early. The worker reads this at the top of its inner loop
+	/// and bails. Reset to `false` before each new walk.
+	cancel: Arc<AtomicBool>,
 }
 
 static LIMIT_COUNT: usize = 3000;
@@ -76,6 +92,8 @@ impl AsyncLog {
 			partial_extract: AtomicBool::new(false),
 			graph_walker: Arc::new(Mutex::new(GraphWalker::new())),
 			first_parent: false,
+			ordering: LogOrdering::default(),
+			cancel: Arc::new(AtomicBool::new(false)),
 		}
 	}
 
@@ -159,11 +177,25 @@ impl AsyncLog {
 		self.background.store(true, Ordering::Relaxed);
 	}
 
-	/// Toggle first-parent traversal. Resets the cached head so the
-	/// next `fetch()` starts a fresh walk.
+	/// Toggle first-parent traversal. Signals any in-flight walker to
+	/// exit early and resets the cached head so the next `fetch()`
+	/// starts a fresh walk in the new mode.
 	pub fn set_first_parent(&mut self, v: bool) -> Result<()> {
 		if self.first_parent != v {
 			self.first_parent = v;
+			self.cancel.store(true, Ordering::Relaxed);
+			*self.current_head.lock()? = None;
+		}
+		Ok(())
+	}
+
+	/// Set the commit-log ordering. Signals any in-flight walker to
+	/// exit early and resets the cached head so the next `fetch()`
+	/// starts a fresh walk in the new ordering.
+	pub fn set_ordering(&mut self, v: LogOrdering) -> Result<()> {
+		if self.ordering != v {
+			self.ordering = v;
+			self.cancel.store(true, Ordering::Relaxed);
 			*self.current_head.lock()? = None;
 		}
 		Ok(())
@@ -197,6 +229,7 @@ impl AsyncLog {
 		}
 
 		self.pending.store(true, Ordering::Relaxed);
+		self.cancel.store(false, Ordering::Relaxed);
 
 		self.clear()?;
 
@@ -205,8 +238,10 @@ impl AsyncLog {
 		let arc_pending = Arc::clone(&self.pending);
 		let arc_background = Arc::clone(&self.background);
 		let arc_graph_walker = Arc::clone(&self.graph_walker);
+		let arc_cancel = Arc::clone(&self.cancel);
 		let filter = self.filter.clone();
 		let first_parent = self.first_parent;
+		let ordering = self.ordering;
 		let repo_path = self.repo.clone();
 
 		if let Ok(head) = repo(&self.repo)?.head() {
@@ -221,10 +256,12 @@ impl AsyncLog {
 				&repo_path,
 				&arc_current,
 				&arc_background,
+				&arc_cancel,
 				&sender,
 				&arc_graph_walker,
 				filter,
 				first_parent,
+				ordering,
 			)
 			.expect("failed to fetch");
 
@@ -236,20 +273,26 @@ impl AsyncLog {
 		Ok(FetchStatus::Started)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn fetch_helper(
 		repo_path: &RepoPath,
 		arc_current: &Arc<Mutex<AsyncLogResult>>,
 		arc_background: &Arc<AtomicBool>,
+		arc_cancel: &Arc<AtomicBool>,
 		sender: &Sender<AsyncGitNotification>,
 		arc_graph_walker: &Arc<Mutex<GraphWalker>>,
 		filter: Option<SharedCommitFilterFn>,
 		first_parent: bool,
+		ordering: LogOrdering,
 	) -> Result<()> {
 		if filter.is_some() || first_parent {
+			// git2 path: first-parent output is linear, so ordering is
+			// irrelevant here and intentionally ignored.
 			Self::fetch_helper_with_filter(
 				repo_path,
 				arc_current,
 				arc_background,
+				arc_cancel,
 				sender,
 				arc_graph_walker,
 				filter,
@@ -260,16 +303,20 @@ impl AsyncLog {
 				repo_path,
 				arc_current,
 				arc_background,
+				arc_cancel,
 				sender,
 				arc_graph_walker,
+				ordering,
 			)
 		}
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn fetch_helper_with_filter(
 		repo_path: &RepoPath,
 		arc_current: &Arc<Mutex<AsyncLogResult>>,
 		arc_background: &Arc<AtomicBool>,
+		arc_cancel: &Arc<AtomicBool>,
 		sender: &Sender<AsyncGitNotification>,
 		arc_graph_walker: &Arc<Mutex<GraphWalker>>,
 		filter: Option<SharedCommitFilterFn>,
@@ -286,6 +333,9 @@ impl AsyncLog {
 			.first_parent(first_parent);
 
 		loop {
+			if arc_cancel.load(Ordering::Relaxed) {
+				break;
+			}
 			entries.clear();
 			let read = walker.read(&mut entries)?;
 
@@ -325,12 +375,15 @@ impl AsyncLog {
 		Ok(())
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn fetch_helper_without_filter(
 		repo_path: &RepoPath,
 		arc_current: &Arc<Mutex<AsyncLogResult>>,
 		arc_background: &Arc<AtomicBool>,
+		arc_cancel: &Arc<AtomicBool>,
 		sender: &Sender<AsyncGitNotification>,
 		arc_graph_walker: &Arc<Mutex<GraphWalker>>,
+		ordering: LogOrdering,
 	) -> Result<()> {
 		let start_time = Instant::now();
 
@@ -350,10 +403,16 @@ impl AsyncLog {
 			},
 		);
 
-		let mut walker =
-			LogWalkerWithoutFilter::new(&mut repo, LIMIT_COUNT)?;
+		let mut walker = LogWalkerWithoutFilter::new(
+			&mut repo,
+			LIMIT_COUNT,
+			ordering,
+		)?;
 
 		loop {
+			if arc_cancel.load(Ordering::Relaxed) {
+				break;
+			}
 			entries.clear();
 			let read = walker.read(&mut entries)?;
 
@@ -427,7 +486,7 @@ mod tests {
 	use crate::sync::{commit, stage_add_file, CommitId, RepoPath};
 	use crate::AsyncLog;
 
-	use super::AsyncLogResult;
+	use super::{AsyncLogResult, LogOrdering};
 
 	use std::fs::File;
 	use std::io::Write;
@@ -454,6 +513,7 @@ mod tests {
 			duration: Duration::default(),
 		}));
 		let arc_background = Arc::new(AtomicBool::new(false));
+		let arc_cancel = Arc::new(AtomicBool::new(false));
 		let arc_graph_walker =
 			Arc::new(Mutex::new(GraphWalker::new()));
 
@@ -461,8 +521,10 @@ mod tests {
 			&subdir_path,
 			&arc_current,
 			&arc_background,
+			&arc_cancel,
 			&tx_git,
 			&arc_graph_walker,
+			LogOrdering::Time,
 		);
 
 		assert_eq!(result.unwrap(), ());
@@ -485,6 +547,7 @@ mod tests {
 			duration: Duration::default(),
 		}));
 		let arc_background = Arc::new(AtomicBool::new(false));
+		let arc_cancel = Arc::new(AtomicBool::new(false));
 		let arc_graph_walker =
 			Arc::new(Mutex::new(GraphWalker::new()));
 
@@ -495,8 +558,10 @@ mod tests {
 			&empty_path,
 			&arc_current,
 			&arc_background,
+			&arc_cancel,
 			&tx_git,
 			&arc_graph_walker,
+			LogOrdering::Time,
 		);
 
 		std::env::remove_var("GIT_DIR");
@@ -588,6 +653,7 @@ mod tests {
 			duration: Duration::default(),
 		}));
 		let arc_background = Arc::new(AtomicBool::new(false));
+		let arc_cancel = Arc::new(AtomicBool::new(false));
 		let arc_graph_walker =
 			Arc::new(Mutex::new(GraphWalker::new()));
 		let (tx_git, _rx_git) = unbounded();
@@ -596,10 +662,12 @@ mod tests {
 			&repo_path,
 			&arc_current,
 			&arc_background,
+			&arc_cancel,
 			&tx_git,
 			&arc_graph_walker,
 			None,
 			true,
+			LogOrdering::Time,
 		)
 		.unwrap();
 
@@ -623,6 +691,7 @@ mod tests {
 			duration: Duration::default(),
 		}));
 		let arc_background = Arc::new(AtomicBool::new(false));
+		let arc_cancel = Arc::new(AtomicBool::new(false));
 		let arc_graph_walker =
 			Arc::new(Mutex::new(GraphWalker::new()));
 		let (tx_git, _rx_git) = unbounded();
@@ -631,10 +700,12 @@ mod tests {
 			&repo_path,
 			&arc_current,
 			&arc_background,
+			&arc_cancel,
 			&tx_git,
 			&arc_graph_walker,
 			None,
 			false,
+			LogOrdering::Time,
 		)
 		.unwrap();
 
