@@ -34,7 +34,11 @@ use ratatui::{
 };
 use std::borrow::Cow;
 use std::{
-	cell::Cell, cmp, collections::BTreeMap, rc::Rc, time::Instant,
+	cell::Cell,
+	cmp,
+	collections::{BTreeMap, HashSet},
+	rc::Rc,
+	time::Instant,
 };
 
 const ELEMENTS_PER_LINE: usize = 9;
@@ -496,7 +500,7 @@ impl CommitList {
 	fn build_graph_spans<'a>(
 		row: &'a GraphRow,
 		graph_col_width: usize,
-		empty_lanes: &std::collections::HashSet<usize>,
+		empty_lanes: &HashSet<usize>,
 	) -> Vec<Span<'a>> {
 		let mut spans = Vec::new();
 
@@ -568,7 +572,7 @@ impl CommitList {
 		width: usize,
 		now: DateTime<Local>,
 		marked: Option<bool>,
-		empty_lanes: &std::collections::HashSet<usize>,
+		empty_lanes: &HashSet<usize>,
 	) -> Line<'a> {
 		let mut txt: Vec<Span> = Vec::with_capacity(
 			ELEMENTS_PER_LINE + if marked.is_some() { 2 } else { 0 },
@@ -624,7 +628,7 @@ impl CommitList {
 		&self,
 		e: &'a LogEntry,
 		txt: &mut Vec<Span<'a>>,
-		empty_lanes: &std::collections::HashSet<usize>,
+		empty_lanes: &HashSet<usize>,
 	) {
 		if let Some(ref row) = e.graph {
 			txt.extend(Self::build_graph_spans(
@@ -727,9 +731,15 @@ impl CommitList {
 
 		let mut txt: Vec<Line> = Vec::with_capacity(height);
 
-		let mut empty_lanes = std::collections::HashSet::new();
+		let mut empty_lanes: HashSet<usize> = HashSet::new();
 
 		if self.show_graph {
+			// Single pass over the visible window: track which lanes
+			// are populated (any `Some` connector counts — bridge
+			// spacers must NOT collapse, or the visible start/end
+			// glyphs would no longer connect) and the max lane
+			// width seen. The empty set is then the complement.
+			let mut populated: HashSet<usize> = HashSet::new();
 			let mut max_lane_in_view = 0;
 			for e in self
 				.items
@@ -740,34 +750,19 @@ impl CommitList {
 				if let Some(row) = &e.graph {
 					max_lane_in_view =
 						max_lane_in_view.max(row.lanes.len());
-				}
-			}
-
-			// Assume all lanes up to max_lane_in_view are empty
-			empty_lanes.extend(0..max_lane_in_view);
-
-			// Remove lanes that have content
-			for e in self
-				.items
-				.iter()
-				.skip(self.scroll_top.get())
-				.take(height)
-			{
-				if let Some(row) = &e.graph {
 					for (lane_idx, conn) in
 						row.lanes.iter().enumerate()
 					{
-						// A `MergeBridgeMid` (or any other connector)
-						// is the bridge spacer between corners on the
-						// same row — collapsing its column away breaks
-						// the bridge between the visible start/end
-						// glyphs. Only `None` truly means empty.
 						if conn.is_some() {
-							empty_lanes.remove(&lane_idx);
+							populated.insert(lane_idx);
 						}
 					}
 				}
 			}
+			empty_lanes.extend(
+				(0..max_lane_in_view)
+					.filter(|i| !populated.contains(i)),
+			);
 
 			let width = ((max_lane_in_view
 				.saturating_sub(empty_lanes.len()))
@@ -1304,11 +1299,8 @@ mod tests {
 			merge_bridge: None,
 			branches: vec![],
 		};
-		let spans = CommitList::build_graph_spans(
-			&row,
-			1,
-			&std::collections::HashSet::new(),
-		);
+		let spans =
+			CommitList::build_graph_spans(&row, 1, &HashSet::new());
 
 		assert_eq!(spans.len(), 2);
 		assert_eq!(spans[0].content, Cow::from(SYM_COMMIT));

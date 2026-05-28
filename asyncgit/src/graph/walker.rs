@@ -88,8 +88,8 @@ impl GraphWalker {
 	}
 
 	/// Feed one commit's identity + parents into the graph state.
-	/// Only the first two parents are inspected (gitui collapses
-	/// octopus merges into a normal merge for graph purposes).
+	/// Parents beyond the second are ignored, so octopus merges
+	/// render as 2-parent merges.
 	pub fn process(
 		&mut self,
 		id: &CommitId,
@@ -526,14 +526,11 @@ mod tests {
 		let id = |n: u8| {
 			CommitId::from_str_unchecked(&format!("{n:040}")).unwrap()
 		};
-		let (a, b, c, d, m) = (id(1), id(2), id(3), id(4), id(5));
+		let (a, b, c, m) = (id(1), id(2), id(3), id(5));
 
 		// M is a 3-parent merge of A, B, C; A is the spine root.
 		let commits: [(CommitId, Vec<CommitId>); 2] =
 			[(m, vec![a, b, c]), (a, vec![])];
-		// `d` is intentionally not referenced as a parent — keeps the
-		// fixture honest about which OIDs participate.
-		let _ = d;
 
 		let mut walker = GraphWalker::new();
 		for (id, parents) in &commits {

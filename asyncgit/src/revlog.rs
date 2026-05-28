@@ -71,6 +71,35 @@ static LIMIT_COUNT: usize = 3000;
 static SLEEP_FOREGROUND: Duration = Duration::from_millis(2);
 static SLEEP_BACKGROUND: Duration = Duration::from_secs(1);
 
+/// Internal abstraction over the two walker flavours so
+/// [`AsyncLog::drive_walker`] can run the same streaming loop
+/// regardless of whether commits flow through the git2-backed
+/// filter walker or the gix-backed plain walker. Both walker types
+/// already expose these signatures; the trait just names the
+/// overlap so the loop is generic.
+trait Walk {
+	fn read(&mut self, out: &mut Vec<CommitId>) -> Result<usize>;
+	fn visited(&self) -> usize;
+}
+
+impl Walk for LogWalker<'_> {
+	fn read(&mut self, out: &mut Vec<CommitId>) -> Result<usize> {
+		Self::read(self, out)
+	}
+	fn visited(&self) -> usize {
+		Self::visited(self)
+	}
+}
+
+impl Walk for LogWalkerWithoutFilter<'_> {
+	fn read(&mut self, out: &mut Vec<CommitId>) -> Result<usize> {
+		Self::read(self, out)
+	}
+	fn visited(&self) -> usize {
+		Self::visited(self)
+	}
+}
+
 impl AsyncLog {
 	///
 	pub fn new(
@@ -190,14 +219,13 @@ impl AsyncLog {
 		self.background.store(true, Ordering::Relaxed);
 	}
 
-	/// Toggle first-parent traversal. Signals any in-flight walker to
-	/// exit early and resets the cached head so the next `fetch()`
-	/// starts a fresh walk in the new mode.
+	/// Set first-parent traversal to `v`. Signals any in-flight
+	/// walker to exit early and resets the cached head so the next
+	/// `fetch()` starts a fresh walk in the new mode.
 	pub fn set_first_parent(&mut self, v: bool) -> Result<()> {
 		if self.first_parent != v {
 			self.first_parent = v;
-			self.cancel.store(true, Ordering::Relaxed);
-			*self.current_head.lock()? = None;
+			self.invalidate_walk()?;
 		}
 		Ok(())
 	}
@@ -208,9 +236,17 @@ impl AsyncLog {
 	pub fn set_ordering(&mut self, v: LogOrdering) -> Result<()> {
 		if self.ordering != v {
 			self.ordering = v;
-			self.cancel.store(true, Ordering::Relaxed);
-			*self.current_head.lock()? = None;
+			self.invalidate_walk()?;
 		}
+		Ok(())
+	}
+
+	/// Signal the in-flight walker to bail and force `fetch()` to
+	/// see a head change on its next call. Shared tail of the
+	/// `set_*` setters above.
+	fn invalidate_walk(&self) -> Result<()> {
+		self.cancel.store(true, Ordering::Relaxed);
+		*self.current_head.lock()? = None;
 		Ok(())
 	}
 
@@ -298,130 +334,86 @@ impl AsyncLog {
 		first_parent: bool,
 		ordering: LogOrdering,
 	) -> Result<()> {
-		if filter.is_some() {
+		if let Some(filter) = filter {
 			// gix doesn't yet support `SharedCommitFilterFn`, so any
 			// custom filter still routes through the git2 walker.
-			// First-parent and ordering both compose with it.
-			Self::fetch_helper_with_filter(
+			// First-parent composes with the filter; ordering does
+			// not — git2's `LogWalker` only walks in commit-time
+			// order, so `ordering` is silently dropped on this path.
+			// No caller exercises this today (`Revlog` always
+			// constructs `AsyncLog` with `filter=None`; the only
+			// filter-using site is `file_revlog.rs`, which doesn't
+			// expose ordering). If a future caller combines them,
+			// surface a hint to the user instead of pretending topo
+			// is honored.
+			let r = repo(repo_path)?;
+			let mut walker = LogWalker::new(&r, LIMIT_COUNT)?
+				.filter(Some(filter))
+				.first_parent(first_parent);
+			Self::drive_walker(
+				&mut walker,
 				repo_path,
 				arc_current,
 				arc_background,
 				arc_cancel,
 				sender,
 				arc_graph_walker,
-				filter,
 				first_parent,
 			)
 		} else {
-			Self::fetch_helper_without_filter(
-				repo_path,
+			let mut repo: gix::Repository = gix_repo(repo_path)?;
+
+			// gix honours GIT_DIR / discovery; reuse the resolved
+			// gitdir for the git2 side (used by
+			// `get_commit_parents`) so both walkers target the same
+			// repo even when `repo_path` is empty and only the
+			// environment locates it.
+			let resolved_path = repo.workdir().map_or_else(
+				|| RepoPath::Path(repo.git_dir().to_path_buf()),
+				|wd| RepoPath::Workdir {
+					gitdir: repo.git_dir().to_path_buf(),
+					workdir: wd.to_path_buf(),
+				},
+			);
+
+			let mut walker = LogWalkerWithoutFilter::new(
+				&mut repo,
+				LIMIT_COUNT,
+				ordering,
+				first_parent,
+			)?;
+			Self::drive_walker(
+				&mut walker,
+				&resolved_path,
 				arc_current,
 				arc_background,
 				arc_cancel,
 				sender,
 				arc_graph_walker,
-				ordering,
 				first_parent,
 			)
 		}
 	}
 
+	/// Run the streaming walk loop common to both walker flavors.
+	/// `parents_path` is the repo path used to look up commit
+	/// parents — distinct from the walker's own repo borrow so the
+	/// no-filter path can reuse the gix-resolved gitdir.
 	#[allow(clippy::too_many_arguments)]
-	fn fetch_helper_with_filter(
-		repo_path: &RepoPath,
+	fn drive_walker<W: Walk>(
+		walker: &mut W,
+		parents_path: &RepoPath,
 		arc_current: &Arc<Mutex<AsyncLogResult>>,
 		arc_background: &Arc<AtomicBool>,
 		arc_cancel: &Arc<AtomicBool>,
 		sender: &Sender<AsyncGitNotification>,
 		arc_graph_walker: &Arc<Mutex<GraphWalker>>,
-		filter: Option<SharedCommitFilterFn>,
 		first_parent: bool,
 	) -> Result<()> {
 		let start_time = Instant::now();
 
 		let mut entries = vec![CommitId::default(); LIMIT_COUNT];
 		entries.resize(0, CommitId::default());
-
-		let r = repo(repo_path)?;
-		let mut walker = LogWalker::new(&r, LIMIT_COUNT)?
-			.filter(filter)
-			.first_parent(first_parent);
-
-		loop {
-			if arc_cancel.load(Ordering::Relaxed) {
-				break;
-			}
-			entries.clear();
-			let read = walker.read(&mut entries)?;
-
-			{
-				let parents =
-					get_commit_parents(repo_path, &entries[0..read])?;
-				let mut gw = arc_graph_walker.lock()?;
-				for (id, ps) in &parents {
-					gw.process(id, ps, first_parent);
-				}
-			}
-
-			let mut current = arc_current.lock()?;
-			current.commits.extend(entries.iter());
-			current.duration = start_time.elapsed();
-
-			if read == 0 {
-				break;
-			}
-			Self::notify(sender);
-
-			let sleep_duration =
-				if arc_background.load(Ordering::Relaxed) {
-					SLEEP_BACKGROUND
-				} else {
-					SLEEP_FOREGROUND
-				};
-
-			thread::sleep(sleep_duration);
-		}
-
-		log::trace!("revlog visited: {}", walker.visited());
-
-		Ok(())
-	}
-
-	#[allow(clippy::too_many_arguments)]
-	fn fetch_helper_without_filter(
-		repo_path: &RepoPath,
-		arc_current: &Arc<Mutex<AsyncLogResult>>,
-		arc_background: &Arc<AtomicBool>,
-		arc_cancel: &Arc<AtomicBool>,
-		sender: &Sender<AsyncGitNotification>,
-		arc_graph_walker: &Arc<Mutex<GraphWalker>>,
-		ordering: LogOrdering,
-		first_parent: bool,
-	) -> Result<()> {
-		let start_time = Instant::now();
-
-		let mut entries = vec![CommitId::default(); LIMIT_COUNT];
-		entries.resize(0, CommitId::default());
-
-		let mut repo: gix::Repository = gix_repo(repo_path)?;
-
-		// gix honours GIT_DIR / discovery; reuse the resolved gitdir
-		// for the git2 side so both walkers target the same repo even
-		// when `repo_path` is empty and only the environment locates it.
-		let resolved_path = repo.workdir().map_or_else(
-			|| RepoPath::Path(repo.git_dir().to_path_buf()),
-			|wd| RepoPath::Workdir {
-				gitdir: repo.git_dir().to_path_buf(),
-				workdir: wd.to_path_buf(),
-			},
-		);
-
-		let mut walker = LogWalkerWithoutFilter::new(
-			&mut repo,
-			LIMIT_COUNT,
-			ordering,
-			first_parent,
-		)?;
 
 		loop {
 			if arc_cancel.load(Ordering::Relaxed) {
@@ -432,7 +424,7 @@ impl AsyncLog {
 
 			{
 				let parents = get_commit_parents(
-					&resolved_path,
+					parents_path,
 					&entries[0..read],
 				)?;
 				let mut gw = arc_graph_walker.lock()?;
@@ -528,15 +520,16 @@ mod tests {
 		let arc_graph_walker =
 			Arc::new(Mutex::new(GraphWalker::new()));
 
-		let result = AsyncLog::fetch_helper_without_filter(
+		let result = AsyncLog::fetch_helper(
 			&subdir_path,
 			&arc_current,
 			&arc_background,
 			&arc_cancel,
 			&tx_git,
 			&arc_graph_walker,
-			LogOrdering::Time,
+			None,
 			false,
+			LogOrdering::Time,
 		);
 
 		assert_eq!(result.unwrap(), ());
@@ -565,7 +558,7 @@ mod tests {
 
 		std::env::set_var("GIT_DIR", git_dir);
 
-		let result = AsyncLog::fetch_helper_without_filter(
+		let result = AsyncLog::fetch_helper(
 			// We pass an empty path, thus testing whether `GIT_DIR`, set above, is taken into account.
 			&empty_path,
 			&arc_current,
@@ -573,8 +566,9 @@ mod tests {
 			&arc_cancel,
 			&tx_git,
 			&arc_graph_walker,
-			LogOrdering::Time,
+			None,
 			false,
+			LogOrdering::Time,
 		);
 
 		std::env::remove_var("GIT_DIR");

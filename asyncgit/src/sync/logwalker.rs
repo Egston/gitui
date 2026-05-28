@@ -135,8 +135,8 @@ enum WalkSource<'a> {
 	Topo(Box<TopoWalk>),
 }
 
-/// This is separate from `LogWalker` because filtering currently (June 2024) works through
-/// `SharedCommitFilterFn`.
+/// This is separate from `LogWalker` because filtering still works
+/// through `SharedCommitFilterFn`.
 ///
 /// `SharedCommitFilterFn` requires access to a `git2::repo::Repository` because, under the hood,
 /// it calls into functions that work with a `git2::repo::Repository`. It seems unwise to open a
@@ -250,6 +250,19 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 /// integrated its branch into the mainline; for a commit already on
 /// the spine it is the commit itself. Returns `None` if `target` is
 /// not an ancestor of HEAD.
+///
+/// # Assumptions
+/// The walk descends HEAD's first-parent spine and uses
+/// `merge_base(cur, target) == target` as the "cur descends from
+/// target" predicate. This is correct when `target` lies on (or
+/// under) the spine — the typical caller (`Revlog::toggle_first_parent`
+/// driven by the currently-selected commit) satisfies that. If
+/// `target` is reachable from HEAD only via second-parent paths, the
+/// loop still walks down the spine and returns the lowest spine
+/// commit that descends from `target`; if no spine commit descends,
+/// returns `None`. The top-level `merge_base(head, target)` check
+/// rules out the "not an ancestor at all" case before the walk
+/// starts.
 pub fn find_integrating_merge(
 	repo_path: &RepoPath,
 	target: CommitId,

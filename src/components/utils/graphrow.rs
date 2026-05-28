@@ -20,6 +20,13 @@ pub const SYM_SPACE: &str = " ";
 /// Map a graph connector to the glyph used to render it. Exhaustive
 /// on `ConnectionType` so the compiler flags any new variant that
 /// forgets to pick a glyph.
+///
+/// `BranchUpMergeStart` and `BranchUpRightMergeEnd` collapse to the
+/// base corner glyphs — terminal fonts don't render a combined
+/// branch-up-plus-bridge corner. The variants are kept distinct in
+/// `ConnectionType` so a future renderer (e.g. styled output, image
+/// renderer) can differentiate without re-deriving the relation in
+/// the walker.
 pub const fn glyph_for(ct: ConnectionType) -> &'static str {
 	match ct {
 		ConnectionType::Vertical => SYM_VERTICAL,
