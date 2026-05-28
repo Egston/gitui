@@ -301,7 +301,7 @@ impl AsyncLog {
 		rayon_core::spawn(move || {
 			scope_time!("async::revlog");
 
-			Self::fetch_helper(
+			if let Err(e) = Self::fetch_helper(
 				&repo_path,
 				&arc_current,
 				&arc_background,
@@ -311,8 +311,13 @@ impl AsyncLog {
 				filter,
 				first_parent,
 				ordering,
-			)
-			.expect("failed to fetch");
+			) {
+				// Panicking here would orphan the worker before
+				// `arc_pending` clears, wedging the UI on the log
+				// spinner forever; log instead and let the next
+				// `fetch()` retry.
+				log::error!("AsyncLog::fetch_helper failed: {e}");
+			}
 
 			arc_pending.store(false, Ordering::Relaxed);
 

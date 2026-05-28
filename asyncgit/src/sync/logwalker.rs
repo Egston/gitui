@@ -218,13 +218,16 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 		let mut count = 0_usize;
 
 		loop {
-			#[allow(clippy::redundant_closure_for_method_calls)]
+			// Propagate walker errors (corrupt pack, missing object,
+			// transient odb error) instead of silently truncating the
+			// history at the first failure — the prior `r.ok()` made a
+			// partial walk indistinguishable from a complete one.
 			let next_id = match &mut self.walk {
 				WalkSource::Simple(w) => {
-					w.next().and_then(|r| r.ok()).map(|i| i.id)
+					w.next().transpose()?.map(|i| i.id)
 				}
 				WalkSource::Topo(w) => {
-					w.next().and_then(|r| r.ok()).map(|i| i.id)
+					w.next().transpose()?.map(|i| i.id)
 				}
 			};
 
@@ -975,6 +978,119 @@ mod tests {
 		assert_eq!(find_integrating_merge(&repo_path, m2)?, Some(m2));
 		// plain mainline commit → itself
 		assert_eq!(find_integrating_merge(&repo_path, m1)?, Some(m1));
+
+		Ok(())
+	}
+
+	/// Documented behaviour: when a branch is "re-merged" after it is
+	/// already integrated, `find_integrating_merge` returns the
+	/// *original* (oldest) merge — the spine commit where the target
+	/// first joined HEAD's history — not the most recent merge.
+	///
+	/// A real re-merge is structurally a noop: once `b1` is reachable
+	/// from the spine, every later spine commit (including any
+	/// "second" merge of the same branch) also reaches it, so the
+	/// loop walks down the spine until it falls off `b1`'s ancestry
+	/// at the commit immediately below the original merge.
+	///
+	/// This test pins that semantic. If a future change "fixes" this
+	/// to return the newest merge, the test will fail and force a
+	/// conscious docstring update.
+	#[test]
+	fn test_find_integrating_merge_remerge_returns_oldest(
+	) -> Result<()> {
+		let file_path = Path::new("foo");
+		let branch_file = Path::new("bar");
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath =
+			root.as_os_str().to_str().unwrap().into();
+
+		// base, then m_base on master
+		File::create(root.join(file_path))?.write_all(b"a")?;
+		stage_add_file(&repo_path, file_path).unwrap();
+		let m_base = commit(&repo_path, "m_base").unwrap();
+
+		// feat branch off m_base with b1
+		repo.branch(
+			"feat",
+			&repo.find_commit(m_base.into()).unwrap(),
+			false,
+		)
+		.unwrap();
+		repo.set_head("refs/heads/feat").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		File::create(root.join(branch_file))?.write_all(b"b1")?;
+		stage_add_file(&repo_path, branch_file).unwrap();
+		let b1 = commit(&repo_path, "b1").unwrap();
+
+		// merge feat → M1 on master
+		repo.set_head("refs/heads/master").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		let m1 = {
+			let feat_c = repo.find_commit(b1.into()).unwrap();
+			let main_c = repo.find_commit(m_base.into()).unwrap();
+			let mut index =
+				repo.merge_commits(&main_c, &feat_c, None).unwrap();
+			let tree_id = index.write_tree_to(&repo).unwrap();
+			let tree = repo.find_tree(tree_id).unwrap();
+			let sig = repo.signature().unwrap();
+			let oid = repo
+				.commit(
+					Some("HEAD"),
+					&sig,
+					&sig,
+					"M1 merge feat",
+					&tree,
+					&[&main_c, &feat_c],
+				)
+				.unwrap();
+			CommitId::new(oid)
+		};
+
+		// extra mainline commit
+		File::create(root.join(file_path))?.write_all(b"a2")?;
+		stage_add_file(&repo_path, file_path).unwrap();
+		let _extra = commit(&repo_path, "extra mainline").unwrap();
+
+		// re-merge feat → M2 (noop content-wise; b1 already on spine)
+		let m2 = {
+			let feat_c = repo.find_commit(b1.into()).unwrap();
+			let main_c =
+				repo.head().unwrap().peel_to_commit().unwrap();
+			let mut index =
+				repo.merge_commits(&main_c, &feat_c, None).unwrap();
+			let tree_id = index.write_tree_to(&repo).unwrap();
+			let tree = repo.find_tree(tree_id).unwrap();
+			let sig = repo.signature().unwrap();
+			let oid = repo
+				.commit(
+					Some("HEAD"),
+					&sig,
+					&sig,
+					"M2 re-merge feat",
+					&tree,
+					&[&main_c, &feat_c],
+				)
+				.unwrap();
+			CommitId::new(oid)
+		};
+
+		// b1 was first integrated at M1; M2 is a redundant re-merge.
+		// Function returns the OLDEST (M1) per its docstring.
+		let found = find_integrating_merge(&repo_path, b1)?;
+		assert_eq!(
+			found,
+			Some(m1),
+			"expected M1 (original integration), got {found:?}; \
+			 M2={m2:?} is the redundant re-merge",
+		);
 
 		Ok(())
 	}
