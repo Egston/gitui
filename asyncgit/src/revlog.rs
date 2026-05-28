@@ -323,6 +323,18 @@ impl AsyncLog {
 		entries.resize(0, CommitId::default());
 
 		let mut repo: gix::Repository = gix_repo(repo_path)?;
+
+		// gix honours GIT_DIR / discovery; reuse the resolved gitdir
+		// for the git2 side so both walkers target the same repo even
+		// when `repo_path` is empty and only the environment locates it.
+		let resolved_path = repo.workdir().map_or_else(
+			|| RepoPath::Path(repo.git_dir().to_path_buf()),
+			|wd| RepoPath::Workdir {
+				gitdir: repo.git_dir().to_path_buf(),
+				workdir: wd.to_path_buf(),
+			},
+		);
+
 		let mut walker =
 			LogWalkerWithoutFilter::new(&mut repo, LIMIT_COUNT)?;
 
@@ -332,7 +344,7 @@ impl AsyncLog {
 
 			{
 				let infos = get_commits_info(
-					repo_path,
+					&resolved_path,
 					&entries[0..read],
 					1000,
 				)?;

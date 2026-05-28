@@ -149,7 +149,8 @@ impl Buffer {
 		self.deltas.push(delta);
 
 		let current_step = self.deltas.len();
-		if current_step > 0 && current_step % CHECKPOINT_INTERVAL == 0
+		if current_step > 0
+			&& current_step.is_multiple_of(CHECKPOINT_INTERVAL)
 		{
 			self.checkpoints
 				.insert(current_step - 1, self.current.clone());

@@ -489,8 +489,8 @@ impl CommitList {
 		}
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn build_graph_spans<'a>(
-		&self,
 		row: &'a GraphRow,
 		graph_col_width: usize,
 		empty_lanes: &std::collections::HashSet<usize>,
@@ -507,23 +507,14 @@ impl CommitList {
 					SYM_VERTICAL,
 					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
 				),
-				Some((ConnectionType::VerticalDotted, color_idx)) => (
-					SYM_VERTICAL_DOTTED,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
+				Some((ConnectionType::VerticalDotted, color_idx)) => {
+					(
+						SYM_VERTICAL_DOTTED,
+						GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
+					)
+				}
 				Some((ConnectionType::Cross, color_idx)) => (
 					SYM_CROSS,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((ConnectionType::BranchUpMergeStart, color_idx)) => (
-					SYM_BRANCH_UP, // Reusing '┛'
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((
-					ConnectionType::BranchUpRightMergeEnd,
-					color_idx,
-				)) => (
-					SYM_BRANCH_UP_RIGHT, // Reusing '┗'
 					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
 				),
 				Some((ConnectionType::CommitNormal, color_idx)) => (
@@ -542,31 +533,49 @@ impl CommitList {
 					SYM_COMMIT_STASH,
 					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
 				),
-				Some((ConnectionType::CommitUncommitted, color_idx)) => (
+				Some((
+					ConnectionType::CommitUncommitted,
+					color_idx,
+				)) => (
 					SYM_COMMIT_UNCOMMITTED,
 					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
 				),
-				Some((ConnectionType::MergeBridgeStart, color_idx)) => (
+				Some((
+					ConnectionType::MergeBridgeStart,
+					color_idx,
+				)) => (
 					SYM_MERGE_BRIDGE_START,
 					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
 				),
-				Some((ConnectionType::MergeBridgeMid, color_idx)) => (
-					SYM_MERGE_BRIDGE_MID,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
-				Some((ConnectionType::MergeBridgeEnd, color_idx)) => (
-					SYM_MERGE_BRIDGE_END,
-					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
-				),
+				Some((ConnectionType::MergeBridgeMid, color_idx)) => {
+					(
+						SYM_MERGE_BRIDGE_MID,
+						GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
+					)
+				}
+				Some((ConnectionType::MergeBridgeEnd, color_idx)) => {
+					(
+						SYM_MERGE_BRIDGE_END,
+						GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
+					)
+				}
 				Some((ConnectionType::BranchDown, color_idx)) => (
 					SYM_BRANCH_DOWN,
 					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
 				),
-				Some((ConnectionType::BranchUp, color_idx)) => (
+				Some((
+					ConnectionType::BranchUp
+					| ConnectionType::BranchUpMergeStart,
+					color_idx,
+				)) => (
 					SYM_BRANCH_UP,
 					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
 				),
-				Some((ConnectionType::BranchUpRight, color_idx)) => (
+				Some((
+					ConnectionType::BranchUpRight
+					| ConnectionType::BranchUpRightMergeEnd,
+					color_idx,
+				)) => (
 					SYM_BRANCH_UP_RIGHT,
 					GRAPH_COLORS[color_idx % GRAPH_COLORS.len()],
 				),
@@ -690,7 +699,7 @@ impl CommitList {
 		empty_lanes: &std::collections::HashSet<usize>,
 	) {
 		if let Some(ref row) = e.graph {
-			txt.extend(self.build_graph_spans(
+			txt.extend(Self::build_graph_spans(
 				row,
 				self.graph_col_width.get(),
 				empty_lanes,
@@ -884,7 +893,7 @@ impl CommitList {
 				local_branches,
 				self.remote_branches_string(e),
 				&self.theme,
-				width.into(),
+				width,
 				now,
 				marked,
 				&empty_lanes,
@@ -1358,7 +1367,6 @@ mod tests {
 
 	#[test]
 	fn test_build_graph_spans() {
-		let cl = CommitList::default();
 		let row = GraphRow {
 			lane_count: 1,
 			commit_lane: 0,
@@ -1369,7 +1377,11 @@ mod tests {
 			merge_bridge: None,
 			branches: vec![],
 		};
-		let spans = cl.build_graph_spans(&row, 1);
+		let spans = CommitList::build_graph_spans(
+			&row,
+			1,
+			&std::collections::HashSet::new(),
+		);
 
 		assert_eq!(spans.len(), 2);
 		assert_eq!(spans[0].content, Cow::from(SYM_COMMIT));
