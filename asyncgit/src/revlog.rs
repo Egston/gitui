@@ -289,9 +289,10 @@ impl AsyncLog {
 		first_parent: bool,
 		ordering: LogOrdering,
 	) -> Result<()> {
-		if filter.is_some() || first_parent {
-			// git2 path: first-parent output is linear, so ordering is
-			// irrelevant here and intentionally ignored.
+		if filter.is_some() {
+			// gix doesn't yet support `SharedCommitFilterFn`, so any
+			// custom filter still routes through the git2 walker.
+			// First-parent and ordering both compose with it.
 			Self::fetch_helper_with_filter(
 				repo_path,
 				arc_current,
@@ -311,6 +312,7 @@ impl AsyncLog {
 				sender,
 				arc_graph_walker,
 				ordering,
+				first_parent,
 			)
 		}
 	}
@@ -385,6 +387,7 @@ impl AsyncLog {
 		sender: &Sender<AsyncGitNotification>,
 		arc_graph_walker: &Arc<Mutex<GraphWalker>>,
 		ordering: LogOrdering,
+		first_parent: bool,
 	) -> Result<()> {
 		let start_time = Instant::now();
 
@@ -408,6 +411,7 @@ impl AsyncLog {
 			&mut repo,
 			LIMIT_COUNT,
 			ordering,
+			first_parent,
 		)?;
 
 		loop {
@@ -424,9 +428,7 @@ impl AsyncLog {
 				)?;
 				let mut gw = arc_graph_walker.lock()?;
 				for (id, ps) in &parents {
-					// gix fast path is never used in first-parent
-					// mode (fetch routes through the git2 walker)
-					gw.process(id, ps, false);
+					gw.process(id, ps, first_parent);
 				}
 			}
 
@@ -525,6 +527,7 @@ mod tests {
 			&tx_git,
 			&arc_graph_walker,
 			LogOrdering::Time,
+			false,
 		);
 
 		assert_eq!(result.unwrap(), ());
@@ -562,6 +565,7 @@ mod tests {
 			&tx_git,
 			&arc_graph_walker,
 			LogOrdering::Time,
+			false,
 		);
 
 		std::env::remove_var("GIT_DIR");

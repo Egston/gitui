@@ -155,11 +155,7 @@ impl Revlog {
 		} else {
 			""
 		};
-		// Topo ordering has no effect in first-parent mode (the git2
-		// first-parent walk is already linear and ignores
-		// `LogOrdering`), so the badge would be misleading there.
-		let topo_badge =
-			if topo && !first_parent { " [topo]" } else { "" };
+		let topo_badge = if topo { " [topo]" } else { "" };
 		format!("{base}{fp}{topo_badge}")
 	}
 

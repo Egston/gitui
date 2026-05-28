@@ -152,11 +152,15 @@ pub struct LogWalkerWithoutFilter<'a> {
 }
 
 impl<'a> LogWalkerWithoutFilter<'a> {
-	///
+	/// Create a walker over the gix repo. `ordering` chooses between
+	/// commit-time and topological walk; `first_parent` mimics
+	/// `git log --first-parent` by following only the first parent
+	/// at each step (composes with either ordering).
 	pub fn new(
 		repo: &'a mut gix::Repository,
 		limit: usize,
 		ordering: LogOrdering,
+		first_parent: bool,
 	) -> Result<Self> {
 		// This seems to be an object cache size that yields optimal
 		// performance. There's no specific reason this is 2^14, so
@@ -168,7 +172,7 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 
 		let walk = match ordering {
 			LogOrdering::Time => {
-				let platform = repo
+				let mut platform = repo
 					.rev_walk(tips)
 					.sorting(
 						gix::revision::walk::Sorting::ByCommitTime(
@@ -176,17 +180,24 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 						),
 					)
 					.use_commit_graph(false);
+				if first_parent {
+					platform = platform.first_parent_only();
+				}
 				WalkSource::Simple(platform.all()?)
 			}
 			LogOrdering::Topo => {
-				let topo_walk = topo::Builder::from_iters(
+				let mut builder = topo::Builder::from_iters(
 					repo.objects.clone(),
 					tips,
 					None::<Vec<gix::ObjectId>>,
 				)
-				.sorting(topo::Sorting::TopoOrder)
-				.build()?;
-				WalkSource::Topo(Box::new(topo_walk))
+				.sorting(topo::Sorting::TopoOrder);
+				if first_parent {
+					builder = builder.parents(
+						gix::traverse::commit::Parents::First,
+					);
+				}
+				WalkSource::Topo(Box::new(builder.build()?))
 			}
 		};
 
@@ -384,6 +395,7 @@ mod tests {
 			&mut repo,
 			100,
 			crate::LogOrdering::Time,
+			false,
 		)?;
 		let mut items = Vec::new();
 		assert!(matches!(walk.read(&mut items), Ok(2)));
@@ -740,6 +752,7 @@ mod tests {
 			&mut grepo,
 			100,
 			LogOrdering::Topo,
+			false,
 		)?;
 		let mut items = Vec::new();
 		walk.read(&mut items)?;
@@ -758,6 +771,94 @@ mod tests {
 			pos(&commit_c),
 			pos(&commit_r),
 		);
+
+		Ok(())
+	}
+
+	/// gix walker with `first_parent=true` mirrors the git2 walker
+	/// behaviour: the off-spine branch commits are skipped, both the
+	/// mainline commit and the integrating merge are kept. Composes
+	/// with `LogOrdering::Topo` (regression for the previous gap
+	/// where first-parent silently dropped the topo preference).
+	#[test]
+	fn test_gix_first_parent_excludes_branch_commits() -> Result<()> {
+		let file_path = Path::new("foo");
+		let branch_file = Path::new("bar");
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+
+		// A on master
+		File::create(root.join(file_path))?.write_all(b"a")?;
+		stage_add_file(repo_path, file_path).unwrap();
+		let commit_a = commit(repo_path, "A").unwrap();
+
+		// feat at A, then B
+		repo.branch(
+			"feat",
+			&repo.find_commit(commit_a.into()).unwrap(),
+			false,
+		)
+		.unwrap();
+		repo.set_head("refs/heads/feat").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		File::create(root.join(branch_file))?.write_all(b"b")?;
+		stage_add_file(repo_path, branch_file).unwrap();
+		let commit_b = commit(repo_path, "B on feat").unwrap();
+
+		// back to master, C, then merge
+		repo.set_head("refs/heads/master").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		File::create(root.join(file_path))?.write_all(b"c")?;
+		stage_add_file(repo_path, file_path).unwrap();
+		let commit_c = commit(repo_path, "C on main").unwrap();
+		let merge_id = {
+			let main_c = repo.find_commit(commit_c.into()).unwrap();
+			let feat_c = repo.find_commit(commit_b.into()).unwrap();
+			let mut idx =
+				repo.merge_commits(&main_c, &feat_c, None).unwrap();
+			let tree = repo
+				.find_tree(idx.write_tree_to(&repo).unwrap())
+				.unwrap();
+			let sig = repo.signature().unwrap();
+			CommitId::new(
+				repo.commit(
+					Some("HEAD"),
+					&sig,
+					&sig,
+					"merge feat",
+					&tree,
+					&[&main_c, &feat_c],
+				)
+				.unwrap(),
+			)
+		};
+
+		for ordering in
+			[crate::LogOrdering::Time, crate::LogOrdering::Topo]
+		{
+			let mut grepo = gix_repo(repo_path)?;
+			let mut walk = LogWalkerWithoutFilter::new(
+				&mut grepo, 100, ordering, true,
+			)?;
+			let mut items = Vec::new();
+			walk.read(&mut items)?;
+
+			assert!(
+				!items.contains(&commit_b),
+				"gix first-parent (ordering={ordering:?}) must \
+				 NOT include branch commit B; got {items:?}",
+			);
+			assert!(items.contains(&commit_a), "must include A");
+			assert!(items.contains(&merge_id), "must include merge",);
+		}
 
 		Ok(())
 	}
