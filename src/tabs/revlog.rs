@@ -99,9 +99,12 @@ impl Revlog {
 			None,
 		);
 		if topo_order {
-			// ignore error: head not resolvable yet just means
-			// the first fetch starts fresh anyway
-			let _ = git_log.set_ordering(LogOrdering::Topo);
+			// `set_ordering` on a freshly-constructed `AsyncLog`
+			// only fails on a poisoned `current_head` mutex, which
+			// is impossible before any worker has touched it.
+			git_log
+				.set_ordering(LogOrdering::Topo)
+				.expect("fresh AsyncLog mutex cannot be poisoned");
 		}
 		let mut list = CommitList::new(
 			env,
@@ -275,6 +278,10 @@ impl Revlog {
 					// loaded (e.g. an off-spine commit absent from
 					// the new walk): give up rather than retry on
 					// every tick for the rest of the session.
+					log::info!(
+						"pending selection {target:?} not present \
+						 in the new log walk; selection cleared"
+					);
 					self.pending_selection = None;
 				}
 			}

@@ -198,6 +198,21 @@ impl GraphWalker {
 		head_id: Option<&CommitId>,
 	) -> GraphRow {
 		let alias = self.oids.get(commit_id);
+		// Every commit reaching `render_row` was already fed through
+		// `process()`, which inserts an alias. A missing alias here
+		// is a hard desync (commit rendered before being walked);
+		// loud-fail in debug and log + fall back to lane 0 in
+		// release so the UI doesn't crash on a graph oddity.
+		debug_assert!(
+			alias.is_some(),
+			"render_row called for {commit_id:?} not in oids alias table",
+		);
+		if alias.is_none() {
+			log::error!(
+				"render_row: no alias for {commit_id:?}; \
+				 painting lane 0 (graph may misrender this row)"
+			);
+		}
 		let commit_lane = curr
 			.iter()
 			.position(|c| {

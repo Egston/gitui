@@ -348,9 +348,15 @@ impl AsyncLog {
 			// No caller exercises this today (`Revlog` always
 			// constructs `AsyncLog` with `filter=None`; the only
 			// filter-using site is `file_revlog.rs`, which doesn't
-			// expose ordering). If a future caller combines them,
-			// surface a hint to the user instead of pretending topo
-			// is honored.
+			// expose ordering). Log a hint so a future caller wiring
+			// both up gets a breadcrumb instead of a silent downgrade.
+			if ordering != LogOrdering::Time {
+				log::info!(
+					"AsyncLog: ordering {ordering:?} requested with a \
+					 commit filter; the filter walker only supports \
+					 commit-time order, falling back to Time",
+				);
+			}
 			let r = repo(repo_path)?;
 			let mut walker = LogWalker::new(&r, LIMIT_COUNT)?
 				.filter(Some(filter))
@@ -784,6 +790,148 @@ mod tests {
 		// Drain the final worker before `_td` drops, otherwise the
 		// rayon task races the temp-dir teardown and panics on
 		// discovery.
+		while log.is_pending() {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+
+	/// Companion to the above: when a mode change fires while the
+	/// previous walker is still draining (`fetch()` returns
+	/// `Pending`), the gate-clearing transition is deferred — a
+	/// later `fetch()` call (after the worker finishes) must still
+	/// return `Started`, so `Revlog::update()` eventually clears
+	/// `awaiting_mode_change`. Tested by manipulating the `pending`
+	/// flag directly so the timing is deterministic; we only care
+	/// about the state-machine contract, not the worker's wall-clock.
+	#[test]
+	#[serial]
+	fn test_async_log_fetch_pending_then_started_after_mode_change() {
+		let file_path = Path::new("foo");
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath =
+			root.as_os_str().to_str().unwrap().into();
+		File::create(root.join(file_path))
+			.unwrap()
+			.write_all(b"a")
+			.unwrap();
+		stage_add_file(&repo_path, file_path).unwrap();
+		commit(&repo_path, "seed").unwrap();
+		let (tx_git, _rx_git) = unbounded();
+
+		let mut log = AsyncLog::new(repo_path, &tx_git, None);
+
+		// Prime: one full fetch + drain so `current_head` is cached.
+		assert_eq!(log.fetch().unwrap(), FetchStatus::Started);
+		while log.is_pending() {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+
+		// Simulate "worker still draining" by forcing pending=true.
+		// `set_first_parent` does NOT clear pending (only the worker
+		// does on completion); the subsequent `fetch()` must therefore
+		// observe `Pending` even though the mode just changed.
+		log.pending
+			.store(true, std::sync::atomic::Ordering::Relaxed);
+		log.set_first_parent(true).unwrap();
+		assert_eq!(
+			log.fetch().unwrap(),
+			FetchStatus::Pending,
+			"toggle during in-flight walk must return Pending, not \
+			 Started; the gate stays up and update() reclaims it later",
+		);
+
+		// Worker "finishes": pending clears. The next `fetch()` must
+		// kick off a fresh walk in the new mode (cached head was
+		// invalidated by `set_first_parent`), so it returns Started —
+		// this is the transition `Revlog::update()` waits on.
+		log.pending
+			.store(false, std::sync::atomic::Ordering::Relaxed);
+		assert_eq!(
+			log.fetch().unwrap(),
+			FetchStatus::Started,
+			"once pending clears, fetch() must transition to Started \
+			 so awaiting_mode_change can be cleared",
+		);
+
+		while log.is_pending() {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+
+	/// Mode toggle on a detached HEAD: the spine is just whatever
+	/// HEAD points to. The toggle must succeed and the next walk
+	/// must start from the same commit. Regression cover for "users
+	/// in the middle of a rebase / detached state can still flip
+	/// log modes without an error".
+	#[test]
+	#[serial]
+	fn test_async_log_mode_toggle_on_detached_head() {
+		let file_path = Path::new("foo");
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath =
+			root.as_os_str().to_str().unwrap().into();
+
+		File::create(root.join(file_path))
+			.unwrap()
+			.write_all(b"a")
+			.unwrap();
+		stage_add_file(&repo_path, file_path).unwrap();
+		let c1 = commit(&repo_path, "c1").unwrap();
+		File::create(root.join(file_path))
+			.unwrap()
+			.write_all(b"b")
+			.unwrap();
+		stage_add_file(&repo_path, file_path).unwrap();
+		let _c2 = commit(&repo_path, "c2").unwrap();
+
+		// Detach HEAD at c1.
+		repo.set_head_detached(c1.into()).unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+
+		let (tx_git, _rx_git) = unbounded();
+		let mut log = AsyncLog::new(repo_path, &tx_git, None);
+
+		// Initial walk on detached HEAD.
+		assert_eq!(log.fetch().unwrap(), FetchStatus::Started);
+		while log.is_pending() {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		let before = log.get_items().unwrap();
+		assert_eq!(
+			before,
+			vec![c1],
+			"detached HEAD walk should yield exactly c1",
+		);
+
+		// Toggle first-parent while detached.
+		log.set_first_parent(true).unwrap();
+		assert_eq!(
+			log.fetch().unwrap(),
+			FetchStatus::Started,
+			"toggle on detached HEAD must restart the walk",
+		);
+		while log.is_pending() {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		let after = log.get_items().unwrap();
+		assert_eq!(
+			after,
+			vec![c1],
+			"first-parent walk on detached HEAD@c1 is still just c1",
+		);
+
+		// Toggle topo ordering while detached.
+		log.set_ordering(LogOrdering::Topo).unwrap();
+		assert_eq!(
+			log.fetch().unwrap(),
+			FetchStatus::Started,
+			"ordering toggle on detached HEAD must restart the walk",
+		);
 		while log.is_pending() {
 			std::thread::sleep(Duration::from_millis(10));
 		}
