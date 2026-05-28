@@ -97,6 +97,10 @@ impl AsyncLog {
 		}
 	}
 
+	/// Render graph rows for the visible slice `commit_slice` whose
+	/// first id is the `global_start`-th commit of the walk. Returns
+	/// `None` if the walker hasn't ingested far enough yet (the
+	/// caller should retry on the next tick).
 	pub fn get_graph_rows(
 		&self,
 		commit_slice: &[CommitId],

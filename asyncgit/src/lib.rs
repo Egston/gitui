@@ -8,6 +8,7 @@ It also provides synchronous Git operations.
 It wraps libraries like git2 and gix.
 */
 
+#![forbid(missing_docs)]
 #![deny(
 	mismatched_lifetime_syntaxes,
 	unused_imports,

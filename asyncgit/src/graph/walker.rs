@@ -6,10 +6,19 @@ use crate::sync::CommitId;
 use im::Vector;
 use std::collections::{HashMap, HashSet};
 
+/// Streaming graph state machine. Consume commits with
+/// [`Self::process`] in walker order; ask for rendered rows with
+/// [`Self::compute_rows`].
 pub struct GraphWalker {
+	/// Lane state + per-step delta history.
 	pub buffer: Buffer,
+	/// `CommitId` → numeric alias table.
 	pub oids: GraphOids,
+	/// Reserved for a future `branch_lane` mapping; currently
+	/// unused but preserved across `clear()`.
 	pub branch_lane_map: HashMap<CommitId, usize>,
+	/// For each merge alias, the alias of its second parent (used
+	/// to draw the merge-bridge).
 	pub mergers_map: HashMap<usize, usize>,
 }
 
@@ -20,6 +29,7 @@ impl Default for GraphWalker {
 }
 
 impl GraphWalker {
+	/// Construct an empty graph walker.
 	pub fn new() -> Self {
 		Self {
 			buffer: Buffer::new(),
@@ -128,6 +138,8 @@ impl GraphWalker {
 		self.buffer.update(&chunk);
 	}
 
+	/// Lane state after the `global_idx`-th `process()` call, or an
+	/// empty `Vector` if that step hasn't been recorded yet.
 	pub fn snapshot_at(
 		&self,
 		global_idx: usize,
@@ -139,6 +151,10 @@ impl GraphWalker {
 			.unwrap_or_default()
 	}
 
+	/// Render rows for `commit_range` (one [`GraphRow`] per id),
+	/// reconstructing lane snapshots from the buffer history. The
+	/// `branch_tips` / `stashes` / `head_id` sets drive per-commit
+	/// glyph variants (branch tip, stash marker, HEAD dotted line).
 	pub fn compute_rows(
 		&self,
 		commit_range: &[CommitId],

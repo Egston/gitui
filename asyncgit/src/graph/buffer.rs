@@ -1,22 +1,56 @@
+//! Persistent lane buffer used by the graph walker.
+//!
+//! Tracks the current set of open lanes and records a delta per
+//! processed commit so any historical row can be reconstructed for
+//! the visible window of the log.
+
 use super::chunk::{Chunk, Markers};
 use im::Vector;
 use std::collections::BTreeMap;
 
+/// One mutation applied to the lane buffer during a single
+/// `update()` step.
 #[derive(Clone, Debug)]
 pub enum DeltaOp {
-	Insert { index: usize, item: Option<Chunk> },
-	Remove { index: usize },
-	Replace { index: usize, new: Option<Chunk> },
+	/// Insert `item` at `index`, shifting subsequent lanes right.
+	Insert {
+		/// Lane index.
+		index: usize,
+		/// Inserted cell (may be empty).
+		item: Option<Chunk>,
+	},
+	/// Remove the lane at `index`, shifting subsequent lanes left.
+	Remove {
+		/// Lane index to remove.
+		index: usize,
+	},
+	/// Replace the cell at `index` in place.
+	Replace {
+		/// Lane index.
+		index: usize,
+		/// New cell value.
+		new: Option<Chunk>,
+	},
 }
 
+/// Ordered list of [`DeltaOp`]s applied during one `update()`.
 #[derive(Clone, Debug)]
-pub struct Delta(pub Vec<DeltaOp>);
+pub struct Delta(
+	/// Operations in apply order.
+	pub Vec<DeltaOp>,
+);
 
 const CHECKPOINT_INTERVAL: usize = 100;
 
+/// Mutable lane state plus the delta history needed to reconstruct
+/// any past row on demand.
 pub struct Buffer {
+	/// Live lane state after the last `update()`.
 	pub current: Vector<Option<Chunk>>,
+	/// Per-commit deltas, indexed by walker step.
 	pub deltas: Vec<Delta>,
+	/// Periodic snapshots so `decompress` doesn't have to replay
+	/// from the start.
 	pub checkpoints: BTreeMap<usize, Vector<Option<Chunk>>>,
 	mergers: Vec<usize>,
 	pending_delta: Vec<DeltaOp>,
@@ -29,6 +63,7 @@ impl Default for Buffer {
 }
 
 impl Buffer {
+	/// Construct an empty buffer.
 	pub fn new() -> Self {
 		Self {
 			current: Vector::new(),
@@ -39,10 +74,15 @@ impl Buffer {
 		}
 	}
 
+	/// Record that the upcoming commit owns a merge whose second
+	/// parent should be expanded into a fresh lane.
 	pub fn merger(&mut self, alias: usize) {
 		self.mergers.push(alias);
 	}
 
+	/// Apply one commit's lane updates, append the resulting delta
+	/// to the history, and write a checkpoint every
+	/// `CHECKPOINT_INTERVAL` steps.
 	pub fn update(&mut self, new_chunk: &Chunk) {
 		self.pending_delta.clear();
 
@@ -176,6 +216,10 @@ impl Buffer {
 		self.current.remove(index);
 	}
 
+	/// Reconstruct the lane state for every step in `[start, end]`
+	/// (inclusive), replaying deltas from the nearest checkpoint at
+	/// or before `start`. Returns one snapshot per requested step;
+	/// stops early if `end` is past the last recorded delta.
 	pub fn decompress(
 		&self,
 		start: usize,
