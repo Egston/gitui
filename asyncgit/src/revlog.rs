@@ -2,7 +2,7 @@ use crate::{
 	error::Result,
 	graph::{GraphRow, GraphWalker},
 	sync::{
-		get_commits_info, gix_repo, repo, CommitId, LogWalker,
+		get_commit_parents, gix_repo, repo, CommitId, LogWalker,
 		LogWalkerWithoutFilter, RepoPath, SharedCommitFilterFn,
 	},
 	AsyncGitNotification, Error,
@@ -340,14 +340,11 @@ impl AsyncLog {
 			let read = walker.read(&mut entries)?;
 
 			{
-				let infos = get_commits_info(
-					repo_path,
-					&entries[0..read],
-					1000,
-				)?;
+				let parents =
+					get_commit_parents(repo_path, &entries[0..read])?;
 				let mut gw = arc_graph_walker.lock()?;
-				for info in &infos {
-					gw.process(info, first_parent);
+				for (id, ps) in &parents {
+					gw.process(id, ps, first_parent);
 				}
 			}
 
@@ -417,16 +414,15 @@ impl AsyncLog {
 			let read = walker.read(&mut entries)?;
 
 			{
-				let infos = get_commits_info(
+				let parents = get_commit_parents(
 					&resolved_path,
 					&entries[0..read],
-					1000,
 				)?;
 				let mut gw = arc_graph_walker.lock()?;
-				for info in &infos {
+				for (id, ps) in &parents {
 					// gix fast path is never used in first-parent
 					// mode (fetch routes through the git2 walker)
-					gw.process(info, false);
+					gw.process(id, ps, false);
 				}
 			}
 

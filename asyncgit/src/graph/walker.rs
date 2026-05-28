@@ -2,7 +2,7 @@ use super::buffer::Buffer;
 use super::chunk::{Chunk, Markers};
 use super::oids::GraphOids;
 use super::{ConnectionType, GraphRow};
-use crate::sync::{CommitId, CommitInfo};
+use crate::sync::CommitId;
 use im::Vector;
 use std::collections::{HashMap, HashSet};
 
@@ -81,23 +81,25 @@ impl GraphWalker {
 		lane_colors
 	}
 
+	/// Feed one commit's identity + parents into the graph state.
+	/// Only the first two parents are inspected (gitui collapses
+	/// octopus merges into a normal merge for graph purposes).
 	pub fn process(
 		&mut self,
-		commit: &CommitInfo,
+		id: &CommitId,
+		parents: &[CommitId],
 		first_parent: bool,
 	) {
-		let alias = self.oids.get_or_insert(&commit.id);
-		let parent_a = commit
-			.parents
-			.first()
-			.map(|p| self.oids.get_or_insert(p));
+		let alias = self.oids.get_or_insert(id);
+		let parent_a =
+			parents.first().map(|p| self.oids.get_or_insert(p));
 		// In first-parent mode the branch-side commits are never
 		// walked, so a merge's second-parent lane could never close.
 		// Ignore it entirely: the graph collapses to a single spine.
 		let parent_b = if first_parent {
 			None
 		} else {
-			commit.parents.get(1).map(|p| self.oids.get_or_insert(p))
+			parents.get(1).map(|p| self.oids.get_or_insert(p))
 		};
 
 		let chunk = Chunk {
@@ -469,29 +471,17 @@ mod tests {
 		};
 		let (a, b, c, m) = (id(1), id(2), id(3), id(4));
 
-		let new_info =
-			|id, time, parents: Vec<CommitId>| CommitInfo {
-				message: String::new(),
-				time,
-				author: String::new(),
-				id,
-				parents: parents.into(),
-			};
-
 		// first-parent spine, newest first: M(merge [C,B]), C, A
-		let commits = [
-			new_info(m, 4, vec![c, b]),
-			new_info(c, 3, vec![a]),
-			new_info(a, 1, vec![]),
-		];
+		let commits: [(CommitId, Vec<CommitId>); 3] =
+			[(m, vec![c, b]), (c, vec![a]), (a, vec![])];
 
 		let mut walker = GraphWalker::new();
-		for info in &commits {
-			walker.process(info, true);
+		for (id, parents) in &commits {
+			walker.process(id, parents, true);
 		}
 
 		let ids: Vec<CommitId> =
-			commits.iter().map(|info| info.id).collect();
+			commits.iter().map(|(id, _)| *id).collect();
 		let rows = walker.compute_rows(
 			&ids,
 			0,

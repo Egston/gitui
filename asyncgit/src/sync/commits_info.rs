@@ -123,8 +123,31 @@ pub struct CommitInfo {
 	pub author: String,
 	///
 	pub id: CommitId,
-	///
-	pub parents: SmallVec<[CommitId; 2]>,
+}
+
+/// Cheap parents-only counterpart of [`get_commits_info`]: skips the
+/// message decode and mailmap resolution that the graph walker
+/// (which only reads `id` and `parents`) doesn't need.
+pub fn get_commit_parents(
+	repo_path: &RepoPath,
+	ids: &[CommitId],
+) -> Result<Vec<(CommitId, SmallVec<[CommitId; 2]>)>> {
+	scope_time!("get_commit_parents");
+
+	let repo = repo(repo_path)?;
+
+	ids.iter()
+		.map(|id| {
+			let c = repo.find_commit((*id).into())?;
+			let parents = c
+				.parents()
+				.take(2)
+				.map(|p| CommitId::new(p.id()))
+				.collect();
+			Ok((*id, parents))
+		})
+		.collect::<std::result::Result<Vec<_>, Error>>()
+		.map_err(Into::into)
 }
 
 ///
@@ -158,11 +181,6 @@ pub fn get_commits_info(
 				author,
 				time: c.time().seconds(),
 				id: CommitId(c.id()),
-				parents: c
-					.parents()
-					.take(2)
-					.map(|p| CommitId::new(p.id()))
-					.collect(),
 			}
 		})
 		.collect::<Vec<_>>();
@@ -197,13 +215,6 @@ pub fn get_commit_info(
 		author: author.to_string(),
 		time: commit_ref.time()?.seconds,
 		id: commit.id().detach().into(),
-		parents: commit_ref
-			.parents
-			.iter()
-			.take(2)
-			.map(|p| CommitId::from_str_unchecked(&p.to_string()))
-			.collect::<std::result::Result<Vec<_>, _>>()?
-			.into(),
 	})
 }
 

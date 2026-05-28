@@ -245,14 +245,29 @@ pub fn find_integrating_merge(
 ) -> Result<Option<CommitId>> {
 	let repo = repo(repo_path)?;
 	let target_oid: Oid = target.into();
+	let head_oid = repo.head()?.peel_to_commit()?.id();
 
-	let mut current = repo.head()?.peel_to_commit()?;
+	// Short-circuit: if target isn't an ancestor of HEAD at all,
+	// there is no integrating merge to find. `merge_base` answers
+	// this in one call instead of an O(spine_depth) walk.
+	if repo.merge_base(head_oid, target_oid).ok() != Some(target_oid)
+	{
+		return Ok(None);
+	}
+
+	let mut current = repo.find_commit(head_oid)?;
 	let mut answer: Option<CommitId> = None;
 
 	loop {
 		let cur_oid = current.id();
+		// `cur_oid` descends from `target` iff `merge_base(cur,
+		// target) == target`. This is the same predicate as
+		// `graph_descendant_of` but typically cheaper on long
+		// histories — libgit2's merge-base short-circuits at the
+		// first reachable ancestor.
 		let is_desc = cur_oid == target_oid
-			|| repo.graph_descendant_of(cur_oid, target_oid)?;
+			|| repo.merge_base(cur_oid, target_oid).ok()
+				== Some(target_oid);
 
 		if is_desc {
 			// still on/above the integrating merge: remember it and
