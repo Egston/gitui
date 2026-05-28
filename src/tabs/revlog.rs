@@ -202,7 +202,17 @@ impl Revlog {
 		self.refresh_title();
 		self.list.clear();
 		self.awaiting_mode_change = true;
-		self.git_log.fetch()?;
+		// If the walker was idle, `fetch()` starts the new walk right
+		// here and `Started` is the *only* transition for this mode
+		// change — `update()` would otherwise only see Pending then
+		// NoChange and never clear the gate. If the old walker is
+		// still draining, `fetch()` returns Pending and the gate
+		// stays up until `update()` later observes Started. The
+		// AsyncLog-side precondition is pinned by
+		// `test_async_log_fetch_started_contract_after_mode_change`.
+		if self.git_log.fetch()? == FetchStatus::Started {
+			self.awaiting_mode_change = false;
+		}
 		Ok(())
 	}
 
@@ -221,7 +231,9 @@ impl Revlog {
 			.set_log_topo_order(self.topo_order);
 		self.list.clear();
 		self.awaiting_mode_change = true;
-		self.git_log.fetch()?;
+		if self.git_log.fetch()? == FetchStatus::Started {
+			self.awaiting_mode_change = false;
+		}
 		Ok(())
 	}
 

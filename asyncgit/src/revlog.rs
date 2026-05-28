@@ -497,7 +497,7 @@ mod tests {
 	use crate::sync::{commit, stage_add_file, CommitId, RepoPath};
 	use crate::AsyncLog;
 
-	use super::{AsyncLogResult, LogOrdering};
+	use super::{AsyncLogResult, FetchStatus, LogOrdering};
 
 	use std::fs::File;
 	use std::io::Write;
@@ -727,5 +727,66 @@ mod tests {
 			commits.contains(&commit_b),
 			"full walk must include branch commit B"
 		);
+	}
+
+	/// Contract pinned by `Revlog::toggle_first_parent` /
+	/// `toggle_topo_order`: after a mode-change `set_*()` call the
+	/// next `fetch()` from an idle state MUST return `Started`. The
+	/// toggle handler relies on that one transition to clear its
+	/// `awaiting_mode_change` gate; if `fetch()` ever silently
+	/// downgrades to `Pending` / `NoChange` here, the log goes blank
+	/// after every toggle and only an external HEAD change recovers.
+	#[test]
+	#[serial]
+	fn test_async_log_fetch_started_contract_after_mode_change() {
+		let file_path = Path::new("foo");
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath =
+			root.as_os_str().to_str().unwrap().into();
+		File::create(root.join(file_path))
+			.unwrap()
+			.write_all(b"a")
+			.unwrap();
+		stage_add_file(&repo_path, file_path).unwrap();
+		commit(&repo_path, "seed").unwrap();
+		let (tx_git, _rx_git) = unbounded();
+
+		let mut log = AsyncLog::new(repo_path, &tx_git, None);
+
+		// Prime the walker: first fetch transitions head None → Some,
+		// returns Started, then drains to idle.
+		assert_eq!(log.fetch().unwrap(), FetchStatus::Started);
+		while log.is_pending() {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+
+		// Mode change from idle: gate-clearing transition.
+		log.set_first_parent(true).unwrap();
+		assert_eq!(
+			log.fetch().unwrap(),
+			FetchStatus::Started,
+			"fetch() from idle after set_first_parent must return \
+			 Started; Revlog::toggle_first_parent depends on this \
+			 transition to clear awaiting_mode_change",
+		);
+
+		// Same again for ordering.
+		while log.is_pending() {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		log.set_ordering(LogOrdering::Topo).unwrap();
+		assert_eq!(
+			log.fetch().unwrap(),
+			FetchStatus::Started,
+			"fetch() from idle after set_ordering must return Started",
+		);
+
+		// Drain the final worker before `_td` drops, otherwise the
+		// rayon task races the temp-dir teardown and panics on
+		// discovery.
+		while log.is_pending() {
+			std::thread::sleep(Duration::from_millis(10));
+		}
 	}
 }
