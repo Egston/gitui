@@ -79,6 +79,7 @@ pub struct CommitList {
 	queue: Queue,
 	key_config: SharedKeyConfig,
 	show_graph: bool,
+	first_parent_mode: bool,
 	graph_col_width: Cell<usize>,
 }
 
@@ -104,6 +105,7 @@ impl CommitList {
 			key_config: env.key_config.clone(),
 			title: title.into(),
 			show_graph: true,
+			first_parent_mode: false,
 			graph_col_width: Cell::new(0),
 		}
 	}
@@ -123,6 +125,11 @@ impl CommitList {
 	///
 	pub const fn tags(&self) -> Option<&Tags> {
 		self.tags.as_ref()
+	}
+
+	///
+	pub const fn set_first_parent_mode(&mut self, v: bool) {
+		self.first_parent_mode = v;
 	}
 
 	///
@@ -1068,9 +1075,15 @@ impl DrawableComponent for CommitList {
 			selection,
 		));
 
+		let badge = if self.first_parent_mode {
+			" [⊢ first-parent]"
+		} else {
+			""
+		};
 		let title = format!(
-			"{} {}/{}",
+			"{}{} {}/{}",
 			self.title,
+			badge,
 			self.commits.len().saturating_sub(self.selection),
 			self.commits.len(),
 		);
@@ -1215,6 +1228,7 @@ mod tests {
 				)),
 				queue: Queue::default(),
 				show_graph: true,
+				first_parent_mode: false,
 				graph_col_width: Cell::new(0),
 			}
 		}

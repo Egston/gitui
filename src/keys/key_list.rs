@@ -130,6 +130,7 @@ pub struct KeysList {
 	pub newline: GituiKeyEvent,
 	pub goto_line: GituiKeyEvent,
 	pub log_toggle_graph: GituiKeyEvent,
+	pub log_first_parent: GituiKeyEvent,
 }
 
 #[rustfmt::skip]
@@ -229,6 +230,7 @@ impl Default for KeysList {
 			newline: GituiKeyEvent::new(KeyCode::Enter,  KeyModifiers::empty()),
 			goto_line: GituiKeyEvent::new(KeyCode::Char('L'),  KeyModifiers::SHIFT),
 			log_toggle_graph: GituiKeyEvent::new(KeyCode::Char('g'),  KeyModifiers::empty()),
+			log_first_parent: GituiKeyEvent::new(KeyCode::Char('P'),  KeyModifiers::SHIFT),
 		}
 	}
 }

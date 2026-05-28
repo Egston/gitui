@@ -36,6 +36,7 @@ pub struct LogWalker<'a> {
 	limit: usize,
 	repo: &'a Repository,
 	filter: Option<SharedCommitFilterFn>,
+	first_parent: bool,
 }
 
 impl<'a> LogWalker<'a> {
@@ -52,6 +53,7 @@ impl<'a> LogWalker<'a> {
 			visited: HashSet::with_capacity(1000),
 			repo,
 			filter: None,
+			first_parent: false,
 		})
 	}
 
@@ -69,12 +71,24 @@ impl<'a> LogWalker<'a> {
 		Self { filter, ..self }
 	}
 
+	/// Only traverse the first parent of each commit
+	/// (like `git log --first-parent`).
+	#[must_use]
+	pub fn first_parent(self, v: bool) -> Self {
+		Self {
+			first_parent: v,
+			..self
+		}
+	}
+
 	///
 	pub fn read(&mut self, out: &mut Vec<CommitId>) -> Result<usize> {
 		let mut count = 0_usize;
 
 		while let Some(c) = self.commits.pop() {
-			for p in c.0.parents() {
+			let parent_limit =
+				if self.first_parent { 1 } else { usize::MAX };
+			for p in c.0.parents().take(parent_limit) {
 				self.visit(p);
 			}
 
@@ -282,6 +296,108 @@ mod tests {
 		assert!(matches!(walk.read(&mut items), Ok(0)));
 
 		assert_eq!(items.len(), 0);
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_logwalker_first_parent() -> Result<()> {
+		let file_path = Path::new("foo");
+		let branch_file = Path::new("bar");
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+
+		// commit A on master
+		File::create(root.join(file_path))?.write_all(b"a")?;
+		stage_add_file(repo_path, file_path).unwrap();
+		let commit_a = commit(repo_path, "commit A").unwrap();
+
+		// branch "feat" at A, checkout, commit B
+		repo.branch(
+			"feat",
+			&repo.find_commit(commit_a.into()).unwrap(),
+			false,
+		)
+		.unwrap();
+		repo.set_head("refs/heads/feat").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+
+		File::create(root.join(branch_file))?.write_all(b"b")?;
+		stage_add_file(repo_path, branch_file).unwrap();
+		let commit_b = commit(repo_path, "commit B on feat").unwrap();
+
+		// back to master, commit C
+		repo.set_head("refs/heads/master").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		File::create(root.join(file_path))?.write_all(b"c")?;
+		stage_add_file(repo_path, file_path).unwrap();
+		let commit_c = commit(repo_path, "commit C on main").unwrap();
+
+		// merge feat into master: parents [C, B]
+		let merge_commit_id = {
+			let feat_commit =
+				repo.find_commit(commit_b.into()).unwrap();
+			let main_commit =
+				repo.find_commit(commit_c.into()).unwrap();
+			let mut index = repo
+				.merge_commits(&main_commit, &feat_commit, None)
+				.unwrap();
+			let tree_id = index.write_tree_to(&repo).unwrap();
+			let tree = repo.find_tree(tree_id).unwrap();
+			let sig = repo.signature().unwrap();
+			let oid = repo
+				.commit(
+					Some("HEAD"),
+					&sig,
+					&sig,
+					"merge feat",
+					&tree,
+					&[&main_commit, &feat_commit],
+				)
+				.unwrap();
+			CommitId::new(oid)
+		};
+
+		// full walk: M, C, B, A
+		let mut items = Vec::new();
+		let mut walk = LogWalker::new(&repo, 100)?;
+		walk.read(&mut items)?;
+		assert_eq!(
+			items.len(),
+			4,
+			"full walk should return 4 commits"
+		);
+		assert!(
+			items.contains(&commit_b),
+			"full walk must include branch commit"
+		);
+
+		// first-parent walk: M, C, A (no B)
+		let mut items = Vec::new();
+		let mut walk = LogWalker::new(&repo, 100)?.first_parent(true);
+		walk.read(&mut items)?;
+		assert_eq!(
+			items.len(),
+			3,
+			"first-parent walk should return 3 commits"
+		);
+		assert!(
+			!items.contains(&commit_b),
+			"first-parent walk must NOT include branch commit"
+		);
+		assert!(
+			items.contains(&merge_commit_id),
+			"must include merge commit"
+		);
+		assert!(items.contains(&commit_a), "must include commit A");
 
 		Ok(())
 	}

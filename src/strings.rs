@@ -1621,6 +1621,19 @@ pub mod commands {
 		)
 	}
 
+	pub fn log_first_parent(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"First Parent [{}]",
+				key_config.get_hint(key_config.keys.log_first_parent),
+			),
+			"show only first-parent (mainline) history",
+			CMD_GROUP_LOG,
+		)
+	}
+
 	pub fn reset_commit(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
 			format!(

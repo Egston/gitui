@@ -81,14 +81,24 @@ impl GraphWalker {
 		lane_colors
 	}
 
-	pub fn process(&mut self, commit: &CommitInfo) {
+	pub fn process(
+		&mut self,
+		commit: &CommitInfo,
+		first_parent: bool,
+	) {
 		let alias = self.oids.get_or_insert(&commit.id);
 		let parent_a = commit
 			.parents
 			.first()
 			.map(|p| self.oids.get_or_insert(p));
-		let parent_b =
-			commit.parents.get(1).map(|p| self.oids.get_or_insert(p));
+		// In first-parent mode the branch-side commits are never
+		// walked, so a merge's second-parent lane could never close.
+		// Ignore it entirely: the graph collapses to a single spine.
+		let parent_b = if first_parent {
+			None
+		} else {
+			commit.parents.get(1).map(|p| self.oids.get_or_insert(p))
+		};
 
 		let chunk = Chunk {
 			alias: Some(alias),
@@ -443,6 +453,63 @@ mod tests {
 				c_next,
 				"lanes {i} and {} share color {c_i}",
 				i + 1
+			);
+		}
+	}
+
+	#[test]
+	fn test_first_parent_graph_stays_single_lane() {
+		// A first-parent walk hides branch-side commits. A merge
+		// still lists two parents, but its second parent is never
+		// walked - so processing with first_parent=true must ignore
+		// it, otherwise the lane it opens never closes and the graph
+		// grows an extra lane on every merge.
+		let id = |n: u8| {
+			CommitId::from_str_unchecked(&format!("{n:040}")).unwrap()
+		};
+		let (a, b, c, m) = (id(1), id(2), id(3), id(4));
+
+		let new_info =
+			|id, time, parents: Vec<CommitId>| CommitInfo {
+				message: String::new(),
+				time,
+				author: String::new(),
+				id,
+				parents: parents.into(),
+			};
+
+		// first-parent spine, newest first: M(merge [C,B]), C, A
+		let commits = [
+			new_info(m, 4, vec![c, b]),
+			new_info(c, 3, vec![a]),
+			new_info(a, 1, vec![]),
+		];
+
+		let mut walker = GraphWalker::new();
+		for info in &commits {
+			walker.process(info, true);
+		}
+
+		let ids: Vec<CommitId> =
+			commits.iter().map(|info| info.id).collect();
+		let rows = walker.compute_rows(
+			&ids,
+			0,
+			&HashSet::new(),
+			&HashSet::new(),
+			None,
+		);
+
+		assert_eq!(rows.len(), 3);
+		for row in &rows {
+			assert_eq!(
+				row.lane_count, 1,
+				"first-parent graph must stay single-lane, got {}",
+				row.lane_count
+			);
+			assert!(
+				!row.is_merge,
+				"second parent must be ignored in first-parent mode"
 			);
 		}
 	}

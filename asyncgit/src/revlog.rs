@@ -48,6 +48,7 @@ pub struct AsyncLog {
 	partial_extract: AtomicBool,
 	repo: RepoPath,
 	graph_walker: Arc<Mutex<GraphWalker>>,
+	first_parent: bool,
 }
 
 static LIMIT_COUNT: usize = 3000;
@@ -74,6 +75,7 @@ impl AsyncLog {
 			filter,
 			partial_extract: AtomicBool::new(false),
 			graph_walker: Arc::new(Mutex::new(GraphWalker::new())),
+			first_parent: false,
 		}
 	}
 
@@ -157,6 +159,16 @@ impl AsyncLog {
 		self.background.store(true, Ordering::Relaxed);
 	}
 
+	/// Toggle first-parent traversal. Resets the cached head so the
+	/// next `fetch()` starts a fresh walk.
+	pub fn set_first_parent(&mut self, v: bool) -> Result<()> {
+		if self.first_parent != v {
+			self.first_parent = v;
+			*self.current_head.lock()? = None;
+		}
+		Ok(())
+	}
+
 	///
 	fn current_head(&self) -> Result<Option<CommitId>> {
 		Ok(*self.current_head.lock()?)
@@ -194,6 +206,7 @@ impl AsyncLog {
 		let arc_background = Arc::clone(&self.background);
 		let arc_graph_walker = Arc::clone(&self.graph_walker);
 		let filter = self.filter.clone();
+		let first_parent = self.first_parent;
 		let repo_path = self.repo.clone();
 
 		if let Ok(head) = repo(&self.repo)?.head() {
@@ -211,6 +224,7 @@ impl AsyncLog {
 				&sender,
 				&arc_graph_walker,
 				filter,
+				first_parent,
 			)
 			.expect("failed to fetch");
 
@@ -229,28 +243,27 @@ impl AsyncLog {
 		sender: &Sender<AsyncGitNotification>,
 		arc_graph_walker: &Arc<Mutex<GraphWalker>>,
 		filter: Option<SharedCommitFilterFn>,
+		first_parent: bool,
 	) -> Result<()> {
-		filter.map_or_else(
-			|| {
-				Self::fetch_helper_without_filter(
-					repo_path,
-					arc_current,
-					arc_background,
-					sender,
-					arc_graph_walker,
-				)
-			},
-			|filter| {
-				Self::fetch_helper_with_filter(
-					repo_path,
-					arc_current,
-					arc_background,
-					sender,
-					arc_graph_walker,
-					filter,
-				)
-			},
-		)
+		if filter.is_some() || first_parent {
+			Self::fetch_helper_with_filter(
+				repo_path,
+				arc_current,
+				arc_background,
+				sender,
+				arc_graph_walker,
+				filter,
+				first_parent,
+			)
+		} else {
+			Self::fetch_helper_without_filter(
+				repo_path,
+				arc_current,
+				arc_background,
+				sender,
+				arc_graph_walker,
+			)
+		}
 	}
 
 	fn fetch_helper_with_filter(
@@ -259,7 +272,8 @@ impl AsyncLog {
 		arc_background: &Arc<AtomicBool>,
 		sender: &Sender<AsyncGitNotification>,
 		arc_graph_walker: &Arc<Mutex<GraphWalker>>,
-		filter: SharedCommitFilterFn,
+		filter: Option<SharedCommitFilterFn>,
+		first_parent: bool,
 	) -> Result<()> {
 		let start_time = Instant::now();
 
@@ -267,8 +281,9 @@ impl AsyncLog {
 		entries.resize(0, CommitId::default());
 
 		let r = repo(repo_path)?;
-		let mut walker =
-			LogWalker::new(&r, LIMIT_COUNT)?.filter(Some(filter));
+		let mut walker = LogWalker::new(&r, LIMIT_COUNT)?
+			.filter(filter)
+			.first_parent(first_parent);
 
 		loop {
 			entries.clear();
@@ -282,7 +297,7 @@ impl AsyncLog {
 				)?;
 				let mut gw = arc_graph_walker.lock()?;
 				for info in &infos {
-					gw.process(info);
+					gw.process(info, first_parent);
 				}
 			}
 
@@ -350,7 +365,9 @@ impl AsyncLog {
 				)?;
 				let mut gw = arc_graph_walker.lock()?;
 				for info in &infos {
-					gw.process(info);
+					// gix fast path is never used in first-parent
+					// mode (fetch routes through the git2 walker)
+					gw.process(info, false);
 				}
 			}
 
@@ -404,11 +421,17 @@ mod tests {
 	use tempfile::TempDir;
 
 	use crate::graph::GraphWalker;
-	use crate::sync::tests::{debug_cmd_print, repo_init};
-	use crate::sync::RepoPath;
+	use crate::sync::tests::{
+		debug_cmd_print, repo_init, repo_init_empty,
+	};
+	use crate::sync::{commit, stage_add_file, CommitId, RepoPath};
 	use crate::AsyncLog;
 
 	use super::AsyncLogResult;
+
+	use std::fs::File;
+	use std::io::Write;
+	use std::path::Path;
 
 	#[test]
 	#[serial]
@@ -479,5 +502,146 @@ mod tests {
 		std::env::remove_var("GIT_DIR");
 
 		assert_eq!(result.unwrap(), ());
+	}
+
+	#[test]
+	#[serial]
+	fn test_fetch_first_parent_excludes_branch_commits() {
+		let file_path = Path::new("foo");
+		let branch_file = Path::new("bar");
+		let (_td, repo) = repo_init_empty().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: RepoPath =
+			root.as_os_str().to_str().unwrap().into();
+
+		// commit A on master
+		File::create(root.join(file_path))
+			.unwrap()
+			.write_all(b"a")
+			.unwrap();
+		stage_add_file(&repo_path, file_path).unwrap();
+		let commit_a = commit(&repo_path, "commit A").unwrap();
+
+		// branch "feat" at A, checkout, commit B
+		repo.branch(
+			"feat",
+			&repo.find_commit(commit_a.into()).unwrap(),
+			false,
+		)
+		.unwrap();
+		repo.set_head("refs/heads/feat").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+
+		File::create(root.join(branch_file))
+			.unwrap()
+			.write_all(b"b")
+			.unwrap();
+		stage_add_file(&repo_path, branch_file).unwrap();
+		let commit_b =
+			commit(&repo_path, "commit B on feat").unwrap();
+
+		// back to master, commit C
+		repo.set_head("refs/heads/master").unwrap();
+		repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::default().force(),
+		))
+		.unwrap();
+		File::create(root.join(file_path))
+			.unwrap()
+			.write_all(b"c")
+			.unwrap();
+		stage_add_file(&repo_path, file_path).unwrap();
+		let commit_c =
+			commit(&repo_path, "commit C on main").unwrap();
+
+		// merge feat into master: parents [C, B]
+		let merge_commit_id = {
+			let feat_commit =
+				repo.find_commit(commit_b.into()).unwrap();
+			let main_commit =
+				repo.find_commit(commit_c.into()).unwrap();
+			let mut index = repo
+				.merge_commits(&main_commit, &feat_commit, None)
+				.unwrap();
+			let tree_id = index.write_tree_to(&repo).unwrap();
+			let tree = repo.find_tree(tree_id).unwrap();
+			let sig = repo.signature().unwrap();
+			let oid = repo
+				.commit(
+					Some("HEAD"),
+					&sig,
+					&sig,
+					"merge feat",
+					&tree,
+					&[&main_commit, &feat_commit],
+				)
+				.unwrap();
+			CommitId::new(oid)
+		};
+
+		// first-parent walk: must NOT include B, must include A + M
+		let arc_current = Arc::new(Mutex::new(AsyncLogResult {
+			commits: Vec::new(),
+			duration: Duration::default(),
+		}));
+		let arc_background = Arc::new(AtomicBool::new(false));
+		let arc_graph_walker =
+			Arc::new(Mutex::new(GraphWalker::new()));
+		let (tx_git, _rx_git) = unbounded();
+
+		AsyncLog::fetch_helper(
+			&repo_path,
+			&arc_current,
+			&arc_background,
+			&tx_git,
+			&arc_graph_walker,
+			None,
+			true,
+		)
+		.unwrap();
+
+		let commits = arc_current.lock().unwrap().commits.clone();
+		assert!(
+			!commits.contains(&commit_b),
+			"first-parent walk must NOT include branch commit B"
+		);
+		assert!(
+			commits.contains(&commit_a),
+			"first-parent walk must include commit A"
+		);
+		assert!(
+			commits.contains(&merge_commit_id),
+			"first-parent walk must include merge commit M"
+		);
+
+		// control: full walk (first_parent=false) includes B
+		let arc_current = Arc::new(Mutex::new(AsyncLogResult {
+			commits: Vec::new(),
+			duration: Duration::default(),
+		}));
+		let arc_background = Arc::new(AtomicBool::new(false));
+		let arc_graph_walker =
+			Arc::new(Mutex::new(GraphWalker::new()));
+		let (tx_git, _rx_git) = unbounded();
+
+		AsyncLog::fetch_helper(
+			&repo_path,
+			&arc_current,
+			&arc_background,
+			&tx_git,
+			&arc_graph_walker,
+			None,
+			false,
+		)
+		.unwrap();
+
+		let commits = arc_current.lock().unwrap().commits.clone();
+		assert!(
+			commits.contains(&commit_b),
+			"full walk must include branch commit B"
+		);
 	}
 }

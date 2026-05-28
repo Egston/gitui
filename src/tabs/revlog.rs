@@ -75,6 +75,7 @@ pub struct Revlog {
 	key_config: SharedKeyConfig,
 	sender: Sender<AsyncGitNotification>,
 	theme: SharedTheme,
+	first_parent_mode: bool,
 }
 
 impl Revlog {
@@ -108,7 +109,17 @@ impl Revlog {
 			key_config: env.key_config.clone(),
 			sender: env.sender_git.clone(),
 			theme: env.theme.clone(),
+			first_parent_mode: false,
 		}
+	}
+
+	fn toggle_first_parent(&mut self) -> Result<()> {
+		self.first_parent_mode = !self.first_parent_mode;
+		self.git_log.set_first_parent(self.first_parent_mode)?;
+		self.list.set_first_parent_mode(self.first_parent_mode);
+		self.list.clear();
+		self.git_log.fetch()?;
+		Ok(())
 	}
 
 	///
@@ -637,6 +648,13 @@ impl Component for Revlog {
 						));
 						return Ok(EventState::Consumed);
 					}
+				} else if key_match(
+					k,
+					self.key_config.keys.log_first_parent,
+				) && !self.is_search_pending()
+				{
+					self.toggle_first_parent()?;
+					return Ok(EventState::Consumed);
 				}
 			}
 		}
@@ -644,6 +662,7 @@ impl Component for Revlog {
 		Ok(EventState::NotConsumed)
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,
@@ -667,6 +686,12 @@ impl Component for Revlog {
 
 		out.push(CommandInfo::new(
 			strings::commands::log_details_toggle(&self.key_config),
+			true,
+			self.visible,
+		));
+
+		out.push(CommandInfo::new(
+			strings::commands::log_first_parent(&self.key_config),
 			true,
 			self.visible,
 		));

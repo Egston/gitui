@@ -13,4 +13,4 @@ expression: terminal.backend()
 "│                                                                                        ║"
 "│                                                                                        ║"
 "└────────────────────────────────────────────────────────────────────────────────────────┘"
-"Scroll [↑↓] Mark [˽] Toggle Graph [g] Details [⏎] Branches [b] Compare [⇧C]       more [.]"
+"Scroll [↑↓] Mark [˽] Toggle Graph [g] Details [⏎] First Parent [⇧P] Branches [b]  more [.]"
