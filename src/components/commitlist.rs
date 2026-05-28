@@ -331,9 +331,9 @@ impl CommitList {
 	fn set_highlighted_selection_index(&mut self) {
 		self.highlighted_selection =
 			self.highlights.as_ref().and_then(|highlights| {
-				highlights.iter().position(|entry| {
-					entry == &self.commits[self.selection]
-				})
+				let commit =
+					self.commits.get_index(self.selection)?;
+				highlights.iter().position(|entry| entry == commit)
 			});
 	}
 
@@ -370,12 +370,23 @@ impl CommitList {
 		&mut self,
 		scroll: ScrollType,
 	) -> Result<bool> {
+		// Fall back to normal scrolling when the current walk holds
+		// none of the highlighted commits — e.g. the user toggled
+		// first-parent or topo while a search filter was active and
+		// every matched commit happens to live off the new spine.
+		// Without this, the only navigation path here is
+		// `select_commit(c)?` for an `c` not in `self.commits`, which
+		// bubbles as "Could not select commit" on every arrow press.
+		if !self.any_highlight_loaded() {
+			return self.move_selection_normal(scroll);
+		}
+
 		let (current_index, selection_max) =
 			self.highlighted_selection_info();
 
-		let new_index = match scroll {
-			ScrollType::Up => current_index.saturating_sub(1),
-			ScrollType::Down => current_index.saturating_add(1),
+		let step: isize = match scroll {
+			ScrollType::Up => -1,
+			ScrollType::Down => 1,
 
 			//TODO: support this?
 			// ScrollType::Home => 0,
@@ -383,26 +394,43 @@ impl CommitList {
 			_ => return Ok(false),
 		};
 
-		let new_index =
-			cmp::min(new_index, selection_max.saturating_sub(1));
-
-		let index_changed = new_index != current_index;
-
-		if !index_changed {
+		// Walk the highlight list in `step` direction starting from
+		// `current_index + step`, skipping any highlights not present
+		// in the loaded `commits`. This keeps arrow keys useful when
+		// only a subset of highlighted commits made it into the new
+		// view.
+		let Some(highlights) = self.highlights.as_ref() else {
 			return Ok(false);
+		};
+		let mut idx = isize::try_from(current_index)?;
+		let max = isize::try_from(selection_max)?;
+		loop {
+			idx += step;
+			if idx < 0 || idx >= max {
+				return Ok(false);
+			}
+			// idx is non-negative per the guard above; this cast
+			// cannot truncate for any realistic commit count.
+			#[allow(clippy::cast_sign_loss)]
+			let i = idx as usize;
+			let Some(c) = highlights.iter().nth(i).copied() else {
+				return Ok(false);
+			};
+			if self.commits.contains(&c) {
+				self.select_commit(c)?;
+				return Ok(true);
+			}
 		}
+	}
 
-		let new_selected_commit =
-			self.highlights.as_ref().and_then(|highlights| {
-				highlights.iter().nth(new_index).copied()
-			});
-
-		if let Some(c) = new_selected_commit {
-			self.select_commit(c)?;
-			return Ok(true);
-		}
-
-		Ok(false)
+	/// True iff at least one highlighted commit is in the currently
+	/// loaded `commits`. Highlights index into the search-result set,
+	/// not the visible walk; the two can drift out of sync after a
+	/// mode toggle.
+	fn any_highlight_loaded(&self) -> bool {
+		self.highlights.as_ref().is_some_and(|h| {
+			h.iter().any(|c| self.commits.contains(c))
+		})
 	}
 
 	fn move_selection_normal(
@@ -873,7 +901,9 @@ impl CommitList {
 	}
 
 	fn select_next_highlight(&mut self) {
-		if self.highlights.is_none() {
+		if self.highlights.is_none() || self.commits.is_empty() {
+			// Empty commits would make `selection_highlighted`
+			// index out of bounds; nothing to select either way.
 			return;
 		}
 
@@ -911,11 +941,14 @@ impl CommitList {
 	}
 
 	fn selection_highlighted(&self) -> bool {
-		let commit = self.commits[self.selection];
+		let Some(commit) = self.commits.get_index(self.selection)
+		else {
+			return false;
+		};
 
 		self.highlights
 			.as_ref()
-			.is_some_and(|highlights| highlights.contains(&commit))
+			.is_some_and(|highlights| highlights.contains(commit))
 	}
 
 	fn needs_data(&self, idx: usize, idx_max: usize) -> bool {
