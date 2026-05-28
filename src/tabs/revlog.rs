@@ -177,12 +177,19 @@ impl Revlog {
 			// merge of the previously selected commit (itself
 			// if already on the spine)
 			match selected {
-				Some(c) => {
-					find_integrating_merge(&self.repo.borrow(), c)
-						.ok()
-						.flatten()
-						.or(Some(c))
-				}
+				Some(c) => match find_integrating_merge(
+					&self.repo.borrow(),
+					c,
+				) {
+					Ok(found) => found.or(Some(c)),
+					Err(e) => {
+						log::warn!(
+							"find_integrating_merge({c:?}) failed: \
+							 {e}; falling back to original commit"
+						);
+						Some(c)
+					}
+				},
 				None => None,
 			}
 		} else {

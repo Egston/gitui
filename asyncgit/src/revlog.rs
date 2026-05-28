@@ -109,7 +109,16 @@ impl AsyncLog {
 		stashes: &HashSet<CommitId>,
 		head_id: Option<&CommitId>,
 	) -> Option<Vec<GraphRow>> {
-		let walker_guard = self.graph_walker.lock().ok()?;
+		let walker_guard = match self.graph_walker.lock() {
+			Ok(g) => g,
+			Err(e) => {
+				log::error!(
+					"graph_walker mutex poisoned: {e}; \
+					 graph rendering will stall until restart"
+				);
+				return None;
+			}
+		};
 		let needed_end = global_start + commit_slice.len();
 		if !walker_guard.buffer.ready_up_to(needed_end) {
 			return None;

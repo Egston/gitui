@@ -3,7 +3,7 @@ use super::{
 };
 use crate::error::Result;
 use crate::LogOrdering;
-use git2::{Commit, Oid, Repository};
+use git2::{Commit, ErrorCode, Oid, Repository};
 use gix::revision::Walk;
 use gix::traverse::commit::topo;
 use std::{
@@ -261,9 +261,13 @@ pub fn find_integrating_merge(
 	// Short-circuit: if target isn't an ancestor of HEAD at all,
 	// there is no integrating merge to find. `merge_base` answers
 	// this in one call instead of an O(spine_depth) walk.
-	if repo.merge_base(head_oid, target_oid).ok() != Some(target_oid)
-	{
-		return Ok(None);
+	// `NotFound` is the expected "no common ancestor" signal; any
+	// other error is propagated.
+	match repo.merge_base(head_oid, target_oid) {
+		Ok(base) if base == target_oid => (),
+		Ok(_) => return Ok(None),
+		Err(e) if e.code() == ErrorCode::NotFound => return Ok(None),
+		Err(e) => return Err(e.into()),
 	}
 
 	let mut current = repo.find_commit(head_oid)?;
@@ -276,9 +280,15 @@ pub fn find_integrating_merge(
 		// `graph_descendant_of` but typically cheaper on long
 		// histories — libgit2's merge-base short-circuits at the
 		// first reachable ancestor.
-		let is_desc = cur_oid == target_oid
-			|| repo.merge_base(cur_oid, target_oid).ok()
-				== Some(target_oid);
+		let is_desc = if cur_oid == target_oid {
+			true
+		} else {
+			match repo.merge_base(cur_oid, target_oid) {
+				Ok(base) => base == target_oid,
+				Err(e) if e.code() == ErrorCode::NotFound => false,
+				Err(e) => return Err(e.into()),
+			}
+		};
 
 		if is_desc {
 			// still on/above the integrating merge: remember it and
@@ -292,7 +302,10 @@ pub fn find_integrating_merge(
 
 		match current.parent(0) {
 			Ok(p) => current = p,
-			Err(_) => break,
+			// Root commit: no parent 0 exists. Any other error is
+			// propagated so we don't silently truncate the spine.
+			Err(e) if e.code() == ErrorCode::NotFound => break,
+			Err(e) => return Err(e.into()),
 		}
 	}
 
