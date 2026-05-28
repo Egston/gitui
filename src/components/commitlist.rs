@@ -843,13 +843,12 @@ impl CommitList {
 					for (lane_idx, conn) in
 						row.lanes.iter().enumerate()
 					{
-						if !matches!(
-							conn,
-							None | Some((
-								ConnectionType::MergeBridgeMid,
-								_
-							))
-						) {
+						// A `MergeBridgeMid` (or any other connector)
+						// is the bridge spacer between corners on the
+						// same row — collapsing its column away breaks
+						// the bridge between the visible start/end
+						// glyphs. Only `None` truly means empty.
+						if conn.is_some() {
 							empty_lanes.remove(&lane_idx);
 						}
 					}

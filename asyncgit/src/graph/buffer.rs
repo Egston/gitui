@@ -66,23 +66,21 @@ impl Buffer {
 			None
 		};
 
-		if let Some(idx) = found_idx {
+		let placed_idx = if let Some(idx) = found_idx {
 			self.record_replace(idx, Some(new_chunk.clone()));
+			idx
 		} else if let Some(empty_idx) = empty_lanes.pop() {
 			self.record_replace(empty_idx, Some(new_chunk.clone()));
+			empty_idx
 		} else {
-			self.record_insert(
-				self.current.len(),
-				Some(new_chunk.clone()),
-			);
-		}
+			let idx = self.current.len();
+			self.record_insert(idx, Some(new_chunk.clone()));
+			idx
+		};
 
 		let current_length = self.current.len();
 		for index in 0..current_length {
-			if Some(index) == found_idx {
-				continue;
-			}
-			if found_idx.is_none() && index == current_length - 1 {
+			if index == placed_idx {
 				continue;
 			}
 
@@ -232,5 +230,61 @@ impl Buffer {
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Regression: when a new chunk takes an empty slot, the
+	/// post-replace cleanup loop must still visit every other
+	/// occupied lane. A merge sitting at the tail of `current`
+	/// whose `parent_b` matches the new alias used to be skipped
+	/// (because `index == current_length - 1` short-circuited the
+	/// loop whenever `found_idx` was `None`), leaving a stale
+	/// second-parent reference and a ghost lane on every following
+	/// row.
+	#[test]
+	fn empty_slot_replace_clears_tail_parent_b() {
+		let mut buf = Buffer::new();
+		let alias_a = 10;
+		let alias_m = 20;
+		let alias_x = 30;
+		let alias_y = 40;
+
+		buf.current.push_back(Some(Chunk {
+			alias: Some(alias_a),
+			parent_a: None,
+			parent_b: None,
+			marker: Markers::Commit,
+		}));
+		buf.current.push_back(None);
+		buf.current.push_back(Some(Chunk {
+			alias: Some(alias_m),
+			parent_a: Some(alias_x),
+			parent_b: Some(alias_y),
+			marker: Markers::Commit,
+		}));
+
+		buf.update(&Chunk {
+			alias: Some(alias_y),
+			parent_a: None,
+			parent_b: None,
+			marker: Markers::Commit,
+		});
+
+		let tail = buf
+			.current
+			.iter()
+			.find_map(|c| {
+				c.as_ref().filter(|c| c.alias == Some(alias_m))
+			})
+			.expect("merge chunk must still be present");
+		assert_eq!(
+			tail.parent_b, None,
+			"new alias matched parent_b of tail merge; \
+			 the post-replace loop must clear that reference",
+		);
 	}
 }
