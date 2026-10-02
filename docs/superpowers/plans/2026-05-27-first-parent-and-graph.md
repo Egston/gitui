@@ -44,7 +44,7 @@ Run `make check` before touching anything to establish a clean baseline.
 - [ ] **Step 1: Add remotes**
 
 ```bash
-cd /home/petr/projects/cli/gitui
+cd /path/to/gitui
 git remote add upstream https://github.com/gitui-org/gitui.git 2>/dev/null || echo "already exists"
 git remote add philocalyst https://github.com/philocalyst/gitui.git 2>/dev/null || echo "already exists"
 git fetch upstream master
@@ -256,7 +256,7 @@ Expected: all pass. Fix any clippy issues (unused imports, HashMap not used, etc
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /home/petr/projects/cli/gitui
+cd /path/to/gitui
 git add asyncgit/src/graph/walker.rs
 git commit -m "fix: use greedy graph coloring for adjacent lane color assignment
 
